@@ -1,0 +1,17 @@
+import { Workbook, SpreadsheetFile } from '@oai/artifact-tool';
+import fs from 'node:fs/promises';
+const wb=Workbook.create();
+const ws=wb.worksheets.add('S');
+ws.getRange('A1:C1').values=[['a','b','c']];
+ws.getRange('A1:C1').format.font.bold=true;
+ws.getRange('A1:C1').format.fill.color='#0f766e';
+ws.getRange('A1:C1').format.font.color='#ffffff';
+ws.getRange('A:A').format.columnWidthPx=220;
+ws.getRange('B:B').format.columnWidthPx=120;
+ws.getRange('C:C').format.columnWidthPx=320;
+ws.freezePanes.freezeRows(1);
+ws.charts.add('line', {title:'Test', categories:['8','9'], series:[{name:'lots', values:[10,20]}], from:{row:1,col:4}, extent:{widthPx:480,heightPx:280}});
+const out=await SpreadsheetFile.exportXlsx(wb);
+await fs.mkdir('/Users/jeslgdo/Documents/Codex/2026-05-28/yo',{recursive:true});
+await out.save('/Users/jeslgdo/Documents/Codex/2026-05-28/yo/test_artifact.xlsx');
+console.log('ok');

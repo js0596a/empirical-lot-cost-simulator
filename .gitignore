@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Node / runtime symlink
+node_modules/
+
+# Local logs and temp
+*.log
+.tmp/
+/tmp/
+
+# Notebook / checkpoints
+.ipynb_checkpoints/
