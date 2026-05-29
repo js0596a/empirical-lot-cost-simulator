@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import dash
@@ -40,6 +41,26 @@ def empty_figure(message: str) -> go.Figure:
     fig.update_yaxes(visible=False)
     fig.update_layout(height=340, margin={"l": 20, "r": 20, "t": 50, "b": 20})
     return fig
+
+
+def build_history_options(history: list[dict]) -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    for item in history:
+        run_id = str(item.get("run_id", "")).strip()
+        label = str(item.get("label", run_id)).strip() or run_id
+        if run_id:
+            options.append({"label": label, "value": run_id})
+    return options
+
+
+def history_item_by_id(history: list[dict], run_id: str | None) -> dict | None:
+    rid = str(run_id or "").strip()
+    if not rid:
+        return None
+    for item in history:
+        if str(item.get("run_id", "")).strip() == rid:
+            return item
+    return None
 
 
 PROCESS_OPTIONS = core.PROCESS_OPTIONS
@@ -101,6 +122,8 @@ mini_app.layout = dmc.MantineProvider(
             gap="md",
             children=[
                 dcc.Store(id="lot-store", data=[]),
+                dcc.Store(id="current-sim-store", data=None),
+                dcc.Store(id="sim-history-store", data=[], storage_type="local"),
                 dmc.Alert(
                     core.DATA_ERROR if core.DATA_ERROR else f"Data source: {core.DATA_PATH}",
                     color="red" if core.DATA_ERROR else "teal",
@@ -167,6 +190,33 @@ mini_app.layout = dmc.MantineProvider(
                                 color="indigo",
                                 variant="light",
                                 children="Add lots and click Simulate.",
+                            ),
+                            dmc.Divider(label="Past Simulations", labelPosition="center"),
+                            dmc.Select(
+                                id="sim-history-select",
+                                label="Saved simulations",
+                                data=[],
+                                value=None,
+                                placeholder="Save a simulation first",
+                                clearable=True,
+                                searchable=True,
+                            ),
+                            dmc.Group(
+                                gap="xs",
+                                children=[
+                                    dmc.Button("Save Current", id="save-sim-btn", color="blue", variant="light"),
+                                    dmc.Button("Load Selected", id="load-sim-btn", color="teal", variant="light"),
+                                    dmc.Button("Delete Selected", id="delete-sim-btn", color="red", variant="light"),
+                                    dmc.Button("Clear History", id="clear-history-btn", color="gray", variant="outline"),
+                                ],
+                            ),
+                            dmc.Text(id="sim-history-status", c="dimmed", fz="xs", children="History is empty."),
+                            dmc.Alert(
+                                id="sim-history-preview",
+                                title="Selected Simulation",
+                                color="gray",
+                                variant="light",
+                                children="No saved simulation selected.",
                             ),
                         ],
                     ),
@@ -254,20 +304,46 @@ mini_app.layout = dmc.MantineProvider(
     Output("lot-repeat", "value"),
     Input("add-lot", "n_clicks"),
     Input("clear-lots", "n_clicks"),
+    Input("load-sim-btn", "n_clicks"),
     State("lot-name", "value"),
     State("lot-pieces", "value"),
     State("lot-processes", "value"),
     State("lot-repeat", "value"),
     State("lot-store", "data"),
+    State("sim-history-select", "value"),
+    State("sim-history-store", "data"),
     prevent_initial_call=False,
 )
-def manage_lots(add_clicks, clear_clicks, lot_name, lot_pieces, lot_processes, lot_repeat, lot_store):
-    _ = (add_clicks, clear_clicks)
+def manage_lots(
+    add_clicks,
+    clear_clicks,
+    load_clicks,
+    lot_name,
+    lot_pieces,
+    lot_processes,
+    lot_repeat,
+    lot_store,
+    selected_run_id,
+    sim_history_store,
+):
+    _ = (add_clicks, clear_clicks, load_clicks)
     store = list(lot_store) if isinstance(lot_store, list) else []
     trigger = dash.ctx.triggered_id
 
     if trigger == "clear-lots":
         return [], [], "Lote_1", 1
+
+    if trigger == "load-sim-btn":
+        history = list(sim_history_store) if isinstance(sim_history_store, list) else []
+        item = history_item_by_id(history, selected_run_id)
+        if item is None:
+            rows = build_lot_rows(store)
+            next_name = f"Lote_{len(store)+1}" if store else "Lote_1"
+            return store, rows, next_name, 1
+        loaded_store = list(item.get("lot_store", [])) if isinstance(item.get("lot_store", []), list) else []
+        rows = build_lot_rows(loaded_store)
+        next_name = f"Lote_{len(loaded_store)+1}" if loaded_store else "Lote_1"
+        return loaded_store, rows, next_name, 1
 
     if trigger == "add-lot":
         route = [p for p in (lot_processes or []) if p in PROCESS_OPTIONS]
@@ -290,6 +366,7 @@ def manage_lots(add_clicks, clear_clicks, lot_name, lot_pieces, lot_processes, l
     Output("sim-output", "children"),
     Output("cost-table", "data"),
     Output("cost-fig", "figure"),
+    Output("current-sim-store", "data"),
     Input("run-sim", "n_clicks"),
     State("lot-store", "data"),
     State("date-range", "value"),
@@ -298,13 +375,13 @@ def manage_lots(add_clicks, clear_clicks, lot_name, lot_pieces, lot_processes, l
 )
 def run_simulation(n_clicks, lot_store, date_range, energy_cost, labor_cost):
     if not n_clicks:
-        return "Add lots and click Simulate.", [], empty_figure("Waiting for simulation")
+        return "Add lots and click Simulate.", [], empty_figure("Waiting for simulation"), None
     if core.DATAFRAME.empty:
-        return "No data loaded.", [], empty_figure("No data")
+        return "No data loaded.", [], empty_figure("No data"), None
 
     lots_raw = list(lot_store) if isinstance(lot_store, list) else []
     if not lots_raw:
-        return "No lots configured.", [], empty_figure("No lots configured")
+        return "No lots configured.", [], empty_figure("No lots configured"), None
 
     lots = []
     for i, lot in enumerate(lots_raw, start=1):
@@ -314,7 +391,7 @@ def run_simulation(n_clicks, lot_store, date_range, energy_cost, labor_cost):
             lots.append({"lot_name": str(lot.get("lot_name", f"Lote_{i}")), "pieces": float(pieces), "route": list(route)})
 
     if not lots:
-        return "Configured lots are invalid.", [], empty_figure("Invalid lots")
+        return "Configured lots are invalid.", [], empty_figure("Invalid lots"), None
 
     base = core.DATAFRAME.copy()
     if date_range and len(date_range) == 2 and date_range[0] and date_range[1]:
@@ -324,7 +401,7 @@ def run_simulation(n_clicks, lot_store, date_range, energy_cost, labor_cost):
             base = base[(base["arrival_time"] >= start) & (base["arrival_time"] <= end + pd.Timedelta(days=1))].copy()
 
     if base.empty:
-        return "No rows in selected date range.", [], empty_figure("No rows in scope")
+        return "No rows in selected date range.", [], empty_figure("No rows in scope"), None
 
     rng = np.random.default_rng(20260529)
     ordered_processes = []
@@ -348,7 +425,7 @@ def run_simulation(n_clicks, lot_store, date_range, energy_cost, labor_cost):
             filtered_lots.append({"lot_name": lot["lot_name"], "pieces": lot["pieces"], "route": route})
 
     if not filtered_lots:
-        return "No usable stages for selected lots.", [], empty_figure("No usable stage data")
+        return "No usable stages for selected lots.", [], empty_figure("No usable stage data"), None
 
     arrival_obs = pd.to_datetime(base.get("arrival_time", pd.Series(dtype="datetime64[ns]")), errors="coerce").dropna().sort_values()
     ia_obs = arrival_obs.diff().dt.total_seconds() / 3600.0 if len(arrival_obs) > 1 else pd.Series(dtype=float)
@@ -364,7 +441,7 @@ def run_simulation(n_clicks, lot_store, date_range, energy_cost, labor_cost):
     stage_events = pd.DataFrame(sim.get("stage_rows", []))
     lot_events = pd.DataFrame(sim.get("lot_rows", []))
     if stage_events.empty or lot_events.empty:
-        return "Simulation produced no events.", [], empty_figure("No simulation events")
+        return "Simulation produced no events.", [], empty_figure("No simulation events"), None
 
     energy_cost = float(energy_cost) if energy_cost is not None else 0.12
     labor_cost = float(labor_cost) if labor_cost is not None else 60.0
@@ -442,7 +519,89 @@ def run_simulation(n_clicks, lot_store, date_range, energy_cost, labor_cost):
         + fallback_txt
     )
 
-    return summary, rows, fig
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_id = datetime.now().strftime("sim_%Y%m%d_%H%M%S_%f")
+    label = (
+        f"{ts} | lots={int(sim.get('n', 0))} | "
+        f"pieces={core.safe_number(total_pieces, 0)} | total=${core.safe_number(total_cost, 2)}"
+    )
+    current_payload = {
+        "run_id": run_id,
+        "label": label,
+        "timestamp": ts,
+        "summary": summary,
+        "lot_store": lots_raw,
+        "cost_rows": rows,
+        "fig": fig.to_dict(),
+    }
+
+    return summary, rows, fig, current_payload
+
+
+@mini_app.callback(
+    Output("sim-history-store", "data"),
+    Output("sim-history-select", "data"),
+    Output("sim-history-select", "value"),
+    Output("sim-history-status", "children"),
+    Output("sim-history-preview", "children"),
+    Input("save-sim-btn", "n_clicks"),
+    Input("delete-sim-btn", "n_clicks"),
+    Input("clear-history-btn", "n_clicks"),
+    Input("sim-history-select", "value"),
+    State("sim-history-store", "data"),
+    State("current-sim-store", "data"),
+    prevent_initial_call=False,
+)
+def manage_sim_history(
+    save_clicks,
+    delete_clicks,
+    clear_clicks,
+    selected_run_id,
+    history_store,
+    current_sim_store,
+):
+    _ = (save_clicks, delete_clicks, clear_clicks)
+    history = list(history_store) if isinstance(history_store, list) else []
+    trigger = dash.ctx.triggered_id
+    status = "History is empty." if not history else f"Saved simulations: {len(history)}."
+
+    if trigger == "save-sim-btn":
+        if not isinstance(current_sim_store, dict) or not current_sim_store.get("run_id"):
+            options = build_history_options(history)
+            selected = selected_run_id if history_item_by_id(history, selected_run_id) else (options[0]["value"] if options else None)
+            preview_item = history_item_by_id(history, selected)
+            preview = preview_item.get("summary", "No saved simulation selected.") if preview_item else "No saved simulation selected."
+            return history, options, selected, "Run a simulation first, then click Save Current.", preview
+        history.insert(0, current_sim_store)
+        history = history[:50]
+        selected = str(current_sim_store.get("run_id"))
+        options = build_history_options(history)
+        preview = str(current_sim_store.get("summary", "Saved."))
+        return history, options, selected, f"Saved simulation. Total saved: {len(history)}.", preview
+
+    if trigger == "delete-sim-btn":
+        if not selected_run_id:
+            options = build_history_options(history)
+            selected = options[0]["value"] if options else None
+            preview_item = history_item_by_id(history, selected)
+            preview = preview_item.get("summary", "No saved simulation selected.") if preview_item else "No saved simulation selected."
+            return history, options, selected, "Select a simulation to delete.", preview
+        history = [h for h in history if str(h.get("run_id", "")) != str(selected_run_id)]
+        options = build_history_options(history)
+        selected = options[0]["value"] if options else None
+        preview_item = history_item_by_id(history, selected)
+        preview = preview_item.get("summary", "No saved simulation selected.") if preview_item else "No saved simulation selected."
+        return history, options, selected, f"Deleted simulation. Remaining: {len(history)}.", preview
+
+    if trigger == "clear-history-btn":
+        return [], [], None, "History cleared.", "No saved simulation selected."
+
+    options = build_history_options(history)
+    selected = selected_run_id if history_item_by_id(history, selected_run_id) else (options[0]["value"] if options else None)
+    preview_item = history_item_by_id(history, selected)
+    preview = preview_item.get("summary", "No saved simulation selected.") if preview_item else "No saved simulation selected."
+    status = "History is empty." if not history else f"Saved simulations: {len(history)}."
+    return history, options, selected, status, preview
 
 
 if __name__ == "__main__":
