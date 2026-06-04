@@ -1,50 +1,49 @@
 # Production Flow Decision Studio
 
-A Dash + Plotly + SimPy application built for plant production planning, process EDA, lot-flow simulation, cost estimation, and process quality analysis.
+Dash + SimPy application for production-flow simulation, cost modeling, and process analysis in a leather manufacturing setting.
 
-This project was developed around a real operations problem: production data existed in Excel logbooks, but it was difficult to turn those records into useful decisions about lot routing, machine capacity, queueing behavior, process timing, and cost. The app converts those spreadsheets into an interactive decision tool where a user can upload data, define lots, choose process routes, simulate the plant flow, and review the expected timeline, cost, bottlenecks, and process risk.
+This project was built during my first operations research / data science role in a production plant. The plant had useful timing data in Excel logbooks, but those files were difficult to use for planning. I built this app to clean the records, let a user enter lots and process routes, simulate how those lots move through the plant, and summarize the expected time, cost, and bottlenecks.
 
-## What I Built
+No production workbooks or proprietary plant data are included in this repository.
 
-I built an end-to-end operations research and data science workflow for a leather production environment:
+## Project Summary
 
-- Cleaned and standardized Excel-based production logbook data.
-- Engineered process timing metrics from arrival, start, and finish timestamps.
-- Built per-process exploratory analysis to understand service-time behavior and outliers.
-- Implemented an empirical SimPy simulation for user-defined lot routes.
-- Added process-specific capacity rules, queueing logic, and machine utilization assumptions.
-- Modeled energy, labor, and gas cost by process.
-- Added Gantt charts to show how lots move through the plant over time.
-- Added SPC charts and process capability analysis with `Cp`, `Cpk`, `Pp`, and `Ppk`.
-- Added a Bayesian classifier to compare processes based on service-time behavior.
-- Dockerized the app so it can be run consistently outside the development machine.
-
-The goal is not just dashboarding. The goal is to make messy production records usable for planning decisions.
-
-## Business Problem
-
-The plant runs multiple production processes, each with different timing behavior, machine constraints, and cost structure. A planner may want to answer questions like:
-
-- If I enter these lots today, how long will they take?
-- Which process is driving most of the cost?
-- Which lot route creates bottlenecks?
-- How much labor, energy, and drying gas cost should I expect?
-- Are certain processes behaving outside normal operating limits?
-- Can we compare process timing patterns statistically instead of relying only on intuition?
-
-The app lets a user enter lot configurations directly instead of manually calculating every step in Excel.
-
-## Main App Workflow
+The app turns raw production logbook data into an interactive planning workflow:
 
 1. Upload one or more Excel production logbooks.
-2. The app parses and cleans the data.
-3. The user enters lots, piece counts, and process routes.
-4. The simulator runs the selected lot flow through the plant.
-5. The app returns cost, timeline, queueing, quality, and classification outputs.
+2. Clean and standardize process, timestamp, machine, and piece-count fields.
+3. Enter lots, piece counts, repeats, and process routes.
+4. Simulate lot movement through plant processes using SimPy.
+5. Review timeline, cost, bottleneck, SPC, capability, and Bayesian classifier outputs.
 
-## Data Inputs
+The main goal was to connect data cleaning, operations research, and business reporting in one tool that a non-technical plant user could operate.
 
-The app supports Excel workbooks that contain production time records. The parser looks for columns similar to:
+## What I Worked On
+
+- Built a Dash application with Plotly charts and Dash Mantine Components.
+- Cleaned Excel production records and standardized process names.
+- Engineered service-time metrics from start and finish timestamps.
+- Performed per-process EDA to identify outliers, timing patterns, and data-quality issues.
+- Implemented a SimPy simulation where users define lot size and process route.
+- Modeled process capacity using machine/server counts and process-specific business rules.
+- Estimated energy, labor, and drying gas costs from simulated operating time.
+- Added Gantt charts to visualize how lots move through the plant over time.
+- Added SPC charts and process capability metrics (`Cp`, `Cpk`, `Pp`, `Ppk`).
+- Added a Bayesian service-time classifier to compare process behavior.
+- Dockerized the app for repeatable local deployment.
+
+## Business Questions the App Helps Answer
+
+- How long will a proposed set of lots take to move through the plant?
+- Which process is the main cost driver?
+- Which route creates the longest lead time?
+- How do labor, energy, and gas costs change by lot mix?
+- Which processes show unstable or unusual timing behavior?
+- Are process times within user-defined lower and upper specification limits?
+
+## Data Pipeline
+
+The app is designed for production logbook-style Excel files. The parser looks for fields such as:
 
 - `FECHA`
 - `FECHA INICIAL`
@@ -54,118 +53,71 @@ The app supports Excel workbooks that contain production time records. The parse
 - `PIEZAS`
 - `OPERADOR`
 
-Spanish naming notes:
+Pipeline steps:
 
-- `TIEMPOS` means `Times` or `Time Records`.
-- `BITACORA` / `BITÁCORA` means `Logbook`, here best described as `Production Logbook`.
+1. Read one or more uploaded Excel files.
+2. Normalize column names and process labels.
+3. Parse timestamp fields into usable datetime columns.
+4. Calculate service/process time from finish time minus start time.
+5. Remove invalid rows such as missing timestamps, negative durations, and unusable records.
+6. Apply IQR-based outlier screening for EDA and capability views.
+7. Build process-level inputs for simulation and reporting.
 
-The app can start without a default workbook. In that case, the user uploads Excel files from the browser.
+The app can start without a default workbook. Users can upload Excel files directly through the browser.
 
-## Data Engineering Pipeline
+## Simulation Method
 
-The data pipeline is built to handle imperfect production logs. The main steps are:
+The simulation is route-driven and empirical.
 
-1. Read Excel sheets and identify usable production records.
-2. Normalize process names so spelling variations map to consistent process labels.
-3. Parse timestamp fields into arrival, start, and finish times.
-4. Calculate service time from effective process duration.
-5. Calculate arrival and waiting behavior where the fields are available.
-6. Remove invalid records, missing timestamps, negative durations, and non-usable rows.
-7. Apply outlier screening where requested, especially with IQR-based cleaning.
-8. Rebuild process options, date ranges, machine counts, and simulation inputs from the cleaned data.
-
-The app avoids treating all processes as identical. Each process keeps its own empirical timing distribution and capacity assumptions.
-
-## Simulation Logic
-
-The simulation is empirical and route-driven.
-
-A user creates lots by entering:
+A user enters:
 
 - Lot name
 - Number of pieces
 - Number of repeated lots
-- Process route, selected in any order
+- Process route in the selected order
 
-The simulator then runs those lots through a SimPy model. Each process acts like a station with a finite number of servers/machines. Lots can move through different process routes, and different lots can be active at the same time.
+The app creates SimPy resources for plant processes and simulates each lot moving through its selected route. Lots can overlap in time, so different lots may be processed at different stations at the same time.
 
-The simulation outputs:
+Simulation outputs include:
 
 - Total lead time
-- Process service time
+- Service time by process
 - Queue/wait time
 - Between-process transfer gaps
-- Machine/resource usage
-- Cost by process
-- Gantt chart by lot and process
+- Process cost
+- Gantt timeline
 
-Between process steps, the app adds a random transfer/setup gap using a uniform range of 20 to 30 minutes. This prevents every simulation from looking identical while keeping the transfer delay within the realistic operating range requested by the plant.
-
-## Process-Specific Rules
-
-Some process behavior is not estimated only from raw data. It also uses plant knowledge.
-
-Examples:
-
-- `RASPADO` is constrained to 4 machines based on business input.
-- `RECURTIDO` is user-configurable because its duration depends on the selected operating plan rather than only piece count.
-- Drying-related processes such as `LTD`, `TAIC`, and `AEREO` use operational cleaning/capping logic because some historical records contained unrealistic service times.
-- Energy consumption is process-specific, loaded from the energy reference workbook when available.
-- `RASPADO` has a manual one-time override of `44 kWh/hour` as requested during the project.
-
-These rules are intentionally visible because they are business assumptions, not hidden model behavior.
+A random uniform transfer/setup gap is added between process steps to avoid identical deterministic runs while keeping the delay inside a realistic operating range.
 
 ## Cost Model
 
-The cost model estimates cost by process and by full simulation run.
+The simulator estimates cost by process and by total run.
 
-Cost components include:
+Cost components:
 
 - Energy cost
 - Labor cost
 - Drying gas cost
 
-Energy cost is calculated from:
+Energy cost is estimated from:
 
 ```text
 machine hours * kWh per machine-hour * energy price per kWh
 ```
 
-Labor cost is calculated from:
+Labor cost is estimated from:
 
 ```text
 labor hours * labor rate per hour
 ```
 
-Drying gas cost is treated as a cost per cuero / piece for the drying processes where it applies.
+Drying gas cost is handled as a per-piece cost for drying-related processes where applicable.
 
-The app summarizes:
+## Statistical Process Analysis
 
-- Total cost
-- Cost per piece
-- Cost by process
-- Energy, labor, and gas cost split
-- Highest cost driver
+The app includes a process analysis section for timing metrics.
 
-## Gantt Timeline
-
-The Gantt chart is one of the main operational outputs. It shows each lot moving through each selected process over time.
-
-The chart helps answer:
-
-- When does each lot start and finish?
-- Which process creates the longest block of time?
-- Where are the gaps between process steps?
-- Which lots overlap in the plant?
-- How does a route change affect the schedule?
-
-The Gantt is built from the simulated event table, not from a static chart template.
-
-## SPC and Capability Analysis
-
-The app includes a quality/statistical process control section for process timing metrics.
-
-It supports:
+Implemented views:
 
 - Individuals control chart
 - Moving range chart
@@ -174,38 +126,28 @@ It supports:
 - User-entered `LSL` and `USL`
 - `Cp`, `Cpk`, `Pp`, and `Ppk`
 
-The capability metrics are calculated only when specification limits are provided. The app does not invent specification limits because those should come from engineering, production, or customer requirements.
-
-The capability view is useful for discussing whether a process is stable and whether the observed process performance fits inside the required operating window.
+The app does not invent specification limits. `LSL` and `USL` should come from production, engineering, or customer requirements.
 
 ## Bayesian Classifier
 
-The app includes a simple Bayesian service-time classifier. It compares two process classes using service-time distributions and estimates the posterior probability of a class given a service time.
+The app includes a simple Bayesian classifier for comparing two process timing distributions. Given a service time, the classifier estimates which selected process that time most closely resembles.
 
-Example use case:
+This was added as a decision-support tool, not as a final production labeler.
 
-- Compare `MEDIDO` vs `TAIC`
-- Enter a service time
-- Estimate which process behavior that time more closely resembles
-
-This is not used as a final truth label. It is a decision-support tool for comparing timing behavior when process distributions overlap.
-
-## App Structure
+## Repository Structure
 
 ```text
-new_sim_app.py          Main product-style simulator app
+new_sim_app.py          Main simulator app
 app.py                  Core data cleaning, EDA, queueing, and helper logic
 bayes_classifier_app.py Bayesian classifier module
 process_eda.py          Standalone per-process EDA utility
 assets/studio.css       App styling
-Dockerfile              Container build definition
-docker-compose.yml      Compose run configuration
+Dockerfile              Docker image definition
+docker-compose.yml      Docker Compose configuration
 requirements.txt        Python dependencies
 ```
 
-Generated files, uploads, and plant data are intentionally not committed.
-
-## Local Run
+## Run Locally
 
 Install dependencies:
 
@@ -213,7 +155,7 @@ Install dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
-Run the main app:
+Run the app:
 
 ```bash
 SIM_APP_PORT=8050 python3 -u new_sim_app.py
@@ -225,7 +167,7 @@ Open:
 http://127.0.0.1:8050
 ```
 
-## Docker Run
+## Run with Docker
 
 Build the image:
 
@@ -233,7 +175,7 @@ Build the image:
 docker build -t empirical-lot-cost-simulator .
 ```
 
-Run the app:
+Run the container:
 
 ```bash
 docker run --rm -p 8050:8050 empirical-lot-cost-simulator
@@ -245,7 +187,7 @@ Open:
 http://127.0.0.1:8050
 ```
 
-## Docker Compose
+Docker Compose:
 
 ```bash
 docker compose up --build
@@ -258,8 +200,6 @@ Optional local data mount:
 ./data/energy.xlsx     -> /app/data/energy.xlsx
 ```
 
-The app also supports uploading Excel workbooks directly through the browser, so a default mounted workbook is not required.
-
 ## Environment Variables
 
 ```bash
@@ -271,36 +211,20 @@ ENERGY_REF_XLSX_PATH=/path/to/energy_reference.xlsx
 ENERGY_REF_SHEET=Hoja1
 ```
 
-## Applying This to Another Plant
+## Skills Demonstrated
 
-The app can be adapted to another plant if the new plant has equivalent production timing records. The important requirement is not that the process names are identical, but that the data can be mapped into the same operational structure:
-
-- Process name
-- Arrival/start/end timestamps
-- Machine or resource identifier
-- Piece count or lot size
-- Optional operator and cost references
-
-For another plant, the main work would be:
-
-1. Map the new plant's process names to normalized labels.
-2. Confirm machine/server counts per process.
-3. Confirm valid operating ranges for service times.
-4. Replace energy and gas cost references.
-5. Re-run per-process EDA before trusting simulation outputs.
+- Operations research simulation
+- Production process EDA
+- Queueing and capacity analysis
+- Data cleaning from Excel-based operational records
+- Cost modeling for plant processes
+- Statistical process control and capability analysis
+- Interactive dashboard development with Dash and Plotly
+- Docker-based local deployment
 
 ## Limitations
 
-This is an analytical planning tool, not a replacement for production supervision.
-
-Important limitations:
-
-- Historical data quality directly affects simulation quality.
-- Unrealistic timestamps must be cleaned or capped with plant-approved rules.
-- Specification limits for capability analysis should come from the business, not from the app.
-- Docker currently runs the Dash development server; for external production deployment, use a production WSGI setup.
-- The simulator estimates behavior based on available data and assumptions. It should be validated against real runs before being used for high-stakes scheduling decisions.
-
-## Why This Matters
-
-The value of the project is that it connects statistics, operations research, and business planning in one workflow. Instead of producing disconnected charts, the app turns raw production logs into a tool that helps answer practical plant questions about time, cost, capacity, and process behavior.
+- The quality of the simulation depends on the quality of the historical timing records.
+- Plant-specific capacity and cost assumptions should be reviewed before using the app in another environment.
+- Specification limits for capability analysis must be provided by the business.
+- The Docker image runs the Dash development server; a production deployment should use a production WSGI setup.
