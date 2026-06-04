@@ -2,7 +2,7 @@
 
 Dash + SimPy application for production-flow simulation, cost modeling, queueing analysis, and statistical process analysis in a leather manufacturing setting.
 
-This project reflects work from my first operations research / data science role in a production plant. The plant had useful timing data in Excel logbooks, but those files were difficult to use for planning. I built Python dashboards and simulation workflows to transform raw production logs into operational insights on throughput, bottlenecks, machine capacity, and process costs.
+This project reflects work from my data science role in a production plant. The plant had useful timing data in Excel logbooks, but those files were difficult to use for planning. I built Python dashboards and simulation workflows to transform raw production logs into operational insights on throughput, bottlenecks, machine capacity, and process costs.
 
 No production workbooks or proprietary plant data are included in this repository.
 
@@ -32,7 +32,7 @@ The main goal was to connect data cleaning, EDA, queueing simulation, statistica
 
 - Built Python dashboards and simulation workflows to transform raw production logs into operational insights on throughput, bottlenecks, machine capacity, and process costs.
 - Performed EDA, data cleaning, and statistical modeling on plant process data to support queueing analysis, capability studies, and production planning decisions.
-- Developed OR/data science tools for queueing simulation, control charts, process capability analysis, and Bayesian process classification.
+- Developed data science tools for queueing simulation, control charts, process capability analysis, and Bayesian process classification.
 - Engineered service-time metrics from start and finish timestamps and standardized process names across Excel logbooks.
 - Modeled process capacity using machine/server counts and process-specific business rules.
 - Estimated energy, labor, and drying gas costs from simulated operating time.
