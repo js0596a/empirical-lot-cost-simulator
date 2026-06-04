@@ -5,7 +5,7 @@ import os
 import re
 import unicodedata
 from glob import glob
-from typing import Any
+from typing import Any, Callable
 
 import dash
 import dash_mantine_components as dmc
@@ -1416,12 +1416,46 @@ def build_stage_catalog_for_processes(
     strict_cleaning: bool,
     queue_use_downtime: bool,
     rng: np.random.Generator,
+    rate_iqr_filter: bool = False,
+    rate_iqr_processes: set[str] | None = None,
+    rate_tail_guardrail: bool = False,
+    rate_tail_guardrail_processes: set[str] | None = None,
+    no_piece_scaling_processes: set[str] | None = None,
+    service_hour_caps: dict[str, float] | None = None,
+    service_range_guardrail: bool = False,
+    service_range_guardrail_processes: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     stage_catalog: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
-
+    normalized_rate_filter_set: set[str] | None = None
+    if rate_iqr_processes is not None:
+        normalized_rate_filter_set = {normalize_process_key(x) for x in rate_iqr_processes}
+    normalized_rate_guardrail_set: set[str] | None = None
+    if rate_tail_guardrail_processes is not None:
+        normalized_rate_guardrail_set = {normalize_process_key(x) for x in rate_tail_guardrail_processes}
+    normalized_no_piece_scaling_set: set[str] | None = None
+    if no_piece_scaling_processes is not None:
+        normalized_no_piece_scaling_set = {normalize_process_key(x) for x in no_piece_scaling_processes}
+    normalized_service_range_set: set[str] | None = None
+    if service_range_guardrail_processes is not None:
+        normalized_service_range_set = {normalize_process_key(x) for x in service_range_guardrail_processes}
+    normalized_service_caps: dict[str, float] = {}
+    if service_hour_caps:
+        normalized_service_caps = {
+            normalize_process_key(k): float(v)
+            for k, v in service_hour_caps.items()
+            if v is not None and np.isfinite(float(v)) and float(v) > 0
+        }
     for proc in process_list:
         stage_df = build_stage_clean_data(base_df, proc, strict_cleaning=bool(strict_cleaning))
+        proc_key = normalize_process_key(proc)
+        service_rows_before_cap = int(len(stage_df))
+        service_cap_h = normalized_service_caps.get(proc_key)
+        if service_cap_h is not None and not stage_df.empty:
+            service_h_for_cap = pd.to_numeric(stage_df.get("service_hours", pd.Series(dtype=float)), errors="coerce")
+            stage_df = stage_df[(service_h_for_cap > 0) & (service_h_for_cap <= service_cap_h)].copy()
+        service_rows_after_cap = int(len(stage_df))
+
         service_pool = pd.to_numeric(stage_df.get("service_hours", pd.Series(dtype=float)), errors="coerce").dropna()
         service_pool = service_pool[(service_pool > 0) & np.isfinite(service_pool)]
         if service_pool.empty:
@@ -1437,16 +1471,88 @@ def build_stage_catalog_for_processes(
 
         service_values = service_pool.to_numpy(dtype=float)
         rate_values = rate_pool.to_numpy(dtype=float)
+        service_min_h = float(np.nanmin(service_values)) if service_values.size > 0 else np.nan
+        service_max_h = float(np.nanmax(service_values)) if service_values.size > 0 else np.nan
+
+        # Optional guardrail: per-process IQR filter directly on service rate
+        # (hours per piece). Useful for heavy-tailed secado processes.
+        rate_rows_before = int(rate_values.size)
+        should_filter_rate = bool(rate_iqr_filter) and (
+            normalized_rate_filter_set is None
+            or proc_key in normalized_rate_filter_set
+        )
+        if should_filter_rate and rate_values.size >= 8:
+            rate_series = pd.Series(rate_values)
+            rate_classes, _ = classify_outliers(rate_series, method=FIXED_OUTLIER_METHOD)
+            keep_mask = rate_classes.eq("normal").to_numpy(dtype=bool)
+            filtered = rate_values[keep_mask]
+            # Keep enough stochastic mass; fall back if filtering is too aggressive.
+            if filtered.size >= 5:
+                rate_values = filtered
+        rate_rows_after = int(rate_values.size)
+        should_guardrail_rate = bool(rate_tail_guardrail) and (
+            normalized_rate_guardrail_set is None
+            or proc_key in normalized_rate_guardrail_set
+        )
+        disable_piece_scaling = bool(
+            normalized_no_piece_scaling_set is not None and proc_key in normalized_no_piece_scaling_set
+        )
+        should_guardrail_service_range = bool(service_range_guardrail) and (
+            normalized_service_range_set is None
+            or proc_key in normalized_service_range_set
+        )
+        # Strict secado cap requested by user: keep sampled rates inside Q1-Q3.
+        rate_guardrail_low = float(np.nanquantile(rate_values, 0.25)) if rate_values.size > 0 else np.nan
+        rate_guardrail_high = float(np.nanquantile(rate_values, 0.75)) if rate_values.size > 0 else np.nan
 
         def draw_service_h(
             lot_pieces: float,
             sv_pool: np.ndarray = service_values,
             rate_pool_local: np.ndarray = rate_values,
             rg: np.random.Generator = rng,
+            use_rate_guardrail: bool = should_guardrail_rate,
+            rate_lo_local: float = rate_guardrail_low,
+            rate_hi_local: float = rate_guardrail_high,
+            no_piece_scaling_local: bool = disable_piece_scaling,
+            use_service_range_guardrail: bool = should_guardrail_service_range,
+            service_lo_local: float = service_min_h,
+            service_hi_local: float = service_max_h,
         ) -> float:
+            def within_clean_service_range(candidate_h: float) -> float:
+                if not np.isfinite(candidate_h) or candidate_h <= 0:
+                    candidate_h = float(rg.choice(sv_pool))
+                if (
+                    use_service_range_guardrail
+                    and np.isfinite(service_lo_local)
+                    and np.isfinite(service_hi_local)
+                    and service_hi_local >= service_lo_local > 0
+                    and (candidate_h < service_lo_local or candidate_h > service_hi_local)
+                ):
+                    candidate_h = (
+                        float(rg.uniform(service_lo_local, service_hi_local))
+                        if service_hi_local > service_lo_local
+                        else float(service_hi_local)
+                    )
+                return float(max(1e-6, candidate_h))
+
+            if no_piece_scaling_local:
+                return within_clean_service_range(float(rg.choice(sv_pool)))
             if np.isfinite(lot_pieces) and lot_pieces > 0 and rate_pool_local.size > 0:
-                return float(max(1e-6, float(rg.choice(rate_pool_local)) * float(lot_pieces)))
-            return float(max(1e-6, float(rg.choice(sv_pool))))
+                sampled_rate = float(rg.choice(rate_pool_local))
+                # Guardrail for heavy tails: if sampled secado rate falls outside
+                # [Q1, Q3], redraw uniformly inside [Q1, Q3].
+                if (
+                    use_rate_guardrail
+                    and np.isfinite(sampled_rate)
+                    and np.isfinite(rate_lo_local)
+                    and np.isfinite(rate_hi_local)
+                    and (sampled_rate < rate_lo_local or sampled_rate > rate_hi_local)
+                ):
+                    lo = float(max(1e-9, min(rate_lo_local, rate_hi_local)))
+                    hi = float(max(lo, rate_hi_local))
+                    sampled_rate = float(rg.uniform(lo, hi)) if hi > lo else float(hi)
+                return within_clean_service_range(sampled_rate * float(lot_pieces))
+            return within_clean_service_range(float(rg.choice(sv_pool)))
 
         draw_downtime_h = lambda: 0.0
         if bool(queue_use_downtime):
@@ -1456,7 +1562,25 @@ def build_stage_catalog_for_processes(
         stage_catalog[proc] = {
             "process": proc,
             "servers": int(get_process_server_count(proc)),
+            "machine_labels": sorted(
+                PROCESS_MACHINE_CATALOG_RESOLVED.get(proc_key, set()),
+                key=lambda x: str(x),
+            )
+            or [str(i) for i in range(1, int(get_process_server_count(proc)) + 1)],
             "rows_used": int(len(stage_df)),
+            "service_cap_h": service_cap_h,
+            "service_rows_before_cap": service_rows_before_cap,
+            "service_rows_after_cap": service_rows_after_cap,
+            "service_rows_cap_removed": max(0, service_rows_before_cap - service_rows_after_cap),
+            "rate_rows_before": rate_rows_before,
+            "rate_rows_after": rate_rows_after,
+            "rate_guardrail_on": bool(should_guardrail_rate),
+            "rate_guardrail_low": rate_guardrail_low if np.isfinite(rate_guardrail_low) else None,
+            "rate_guardrail_high": rate_guardrail_high if np.isfinite(rate_guardrail_high) else None,
+            "no_piece_scaling": bool(disable_piece_scaling),
+            "service_range_guardrail_on": bool(should_guardrail_service_range),
+            "service_min_h": service_min_h if np.isfinite(service_min_h) else None,
+            "service_max_h": service_max_h if np.isfinite(service_max_h) else None,
             "mean_service_h_empirical": float(service_pool.mean()),
             "draw_service_h": draw_service_h,
             "draw_downtime_h": draw_downtime_h,
@@ -1469,6 +1593,8 @@ def simulate_lot_plan_flow(
     stage_catalog: dict[str, dict[str, Any]],
     lot_plan: list[dict[str, Any]],
     interarrival_h: np.ndarray,
+    between_steps_gap_sampler: Callable[[], float] | None = None,
+    use_resource_queue: bool = True,
 ) -> dict[str, Any]:
     n = int(len(lot_plan))
     if n == 0:
@@ -1499,45 +1625,131 @@ def simulate_lot_plan_flow(
             "sim_engine": "missing_simpy",
         }
 
-    env = simpy.Environment()
-    resources = {
-        proc: simpy.Resource(env, capacity=int(max(1, spec["servers"])))
-        for proc, spec in stage_catalog.items()
-    }
+    if not bool(use_resource_queue):
+        for i, lot in enumerate(lot_plan):
+            t_now = float(arrivals[i])
+            t_system_arrive = float(t_now)
+            valid_route = [proc for proc in lot.get("route", []) if stage_catalog.get(proc) is not None]
+            valid_steps = int(len(valid_route))
 
-    def lot_process(i: int, lot: dict[str, Any]):
-        yield env.timeout(max(0.0, float(arrivals[i]) - float(env.now)))
-        t_system_arrive = float(env.now)
-        valid_steps = 0
-
-        for step_idx, proc in enumerate(lot["route"], start=1):
-            spec = stage_catalog.get(proc)
-            if spec is None:
-                continue
-            valid_steps += 1
-            t_stage_arrive = float(env.now)
-            with resources[proc].request() as req:
-                yield req
-                t_stage_start = float(env.now)
-                wait_h = t_stage_start - t_stage_arrive
+            for step_idx, proc in enumerate(valid_route, start=1):
+                spec = stage_catalog.get(proc)
+                if spec is None:
+                    continue
+                t_stage_arrive = float(t_now)
+                t_stage_start = float(t_stage_arrive)
+                wait_h = 0.0
                 service_h = float(max(1e-6, spec["draw_service_h"](float(lot["pieces"]))))
                 dt_h = float(max(0.0, spec["draw_downtime_h"]()))
-                if dt_h > 0:
-                    yield env.timeout(dt_h)
-                yield env.timeout(service_h)
-                t_stage_finish = float(env.now)
+                t_stage_finish = float(t_stage_start + dt_h + service_h)
+                between_steps_gap_h = 0.0
+                if step_idx < valid_steps and callable(between_steps_gap_sampler):
+                    try:
+                        between_steps_gap_h = float(max(0.0, between_steps_gap_sampler()))
+                    except Exception:
+                        between_steps_gap_h = 0.0
+
                 stage_rows.append(
                     {
                         "lot_name": lot["lot_name"],
                         "pieces": float(lot["pieces"]),
                         "process": proc,
                         "route_step": int(step_idx),
+                        "system_arrive_h": float(t_system_arrive),
+                        "stage_arrive_h": float(t_stage_arrive),
+                        "stage_start_h": float(t_stage_start),
+                        "stage_finish_h": float(t_stage_finish),
                         "wait_h": float(wait_h),
                         "service_h": float(service_h),
                         "downtime_h": float(dt_h),
+                        "machine_id": None,
+                        "machine_label": None,
+                        "between_steps_gap_h": float(between_steps_gap_h),
                         "stage_time_h": float(t_stage_finish - t_stage_arrive),
                     }
                 )
+                t_now = float(t_stage_finish + between_steps_gap_h)
+
+            total_system_h = float(t_now) - t_system_arrive
+            lot_rows.append(
+                {
+                    "lot_name": lot["lot_name"],
+                    "pieces": float(lot["pieces"]),
+                    "route_len": int(len(lot["route"])),
+                    "valid_steps": int(valid_steps),
+                    "system_arrive_h": float(t_system_arrive),
+                    "system_finish_h": float(t_now),
+                    "system_time_h": float(total_system_h),
+                }
+            )
+
+        return {
+            "n": n,
+            "lot_rows": lot_rows,
+            "stage_rows": stage_rows,
+            "arrival_h": arrivals,
+            "sim_engine": "simpy_no_resource_queue",
+        }
+
+    env = simpy.Environment()
+    machine_stores: dict[str, Any] = {}
+    for proc, spec in stage_catalog.items():
+        labels = [str(x) for x in spec.get("machine_labels", []) if str(x).strip()]
+        if not labels:
+            labels = [str(i) for i in range(1, int(max(1, spec["servers"])) + 1)]
+        labels = labels[: int(max(1, spec["servers"]))]
+        store = simpy.Store(env, capacity=max(1, len(labels)))
+        store.items = list(labels)
+        machine_stores[proc] = store
+
+    def lot_process(i: int, lot: dict[str, Any]):
+        yield env.timeout(max(0.0, float(arrivals[i]) - float(env.now)))
+        t_system_arrive = float(env.now)
+        valid_route = [proc for proc in lot.get("route", []) if stage_catalog.get(proc) is not None]
+        valid_steps = int(len(valid_route))
+
+        for step_idx, proc in enumerate(valid_route, start=1):
+            spec = stage_catalog.get(proc)
+            if spec is None:
+                continue
+            t_stage_arrive = float(env.now)
+            machine_id = str((yield machine_stores[proc].get()))
+            t_stage_start = float(env.now)
+            wait_h = t_stage_start - t_stage_arrive
+            service_h = float(max(1e-6, spec["draw_service_h"](float(lot["pieces"]))))
+            dt_h = float(max(0.0, spec["draw_downtime_h"]()))
+            if dt_h > 0:
+                yield env.timeout(dt_h)
+            yield env.timeout(service_h)
+            t_stage_finish = float(env.now)
+            yield machine_stores[proc].put(machine_id)
+            between_steps_gap_h = 0.0
+            if step_idx < valid_steps and callable(between_steps_gap_sampler):
+                try:
+                    between_steps_gap_h = float(max(0.0, between_steps_gap_sampler()))
+                except Exception:
+                    between_steps_gap_h = 0.0
+            stage_rows.append(
+                {
+                    "lot_name": lot["lot_name"],
+                    "pieces": float(lot["pieces"]),
+                    "process": proc,
+                    "route_step": int(step_idx),
+                    "system_arrive_h": float(t_system_arrive),
+                    "stage_arrive_h": float(t_stage_arrive),
+                    "stage_start_h": float(t_stage_start),
+                    "stage_finish_h": float(t_stage_finish),
+                    "wait_h": float(wait_h),
+                    "service_h": float(service_h),
+                    "downtime_h": float(dt_h),
+                    "machine_id": machine_id,
+                    "machine_label": f"{proc}-{machine_id}",
+                    "between_steps_gap_h": float(between_steps_gap_h),
+                    "stage_time_h": float(t_stage_finish - t_stage_arrive),
+                }
+            )
+            if between_steps_gap_h > 0:
+                yield env.timeout(between_steps_gap_h)
 
         total_system_h = float(env.now) - t_system_arrive
         lot_rows.append(
@@ -1546,6 +1758,8 @@ def simulate_lot_plan_flow(
                 "pieces": float(lot["pieces"]),
                 "route_len": int(len(lot["route"])),
                 "valid_steps": int(valid_steps),
+                "system_arrive_h": float(t_system_arrive),
+                "system_finish_h": float(env.now),
                 "system_time_h": float(total_system_h),
             }
         )
@@ -1842,11 +2056,15 @@ REFERENCE_SHEETS = load_reference_sheets(DATA_PATH)
 ENERGY_REFERENCE = load_energy_reference(ENERGY_REF_PATH, ENERGY_REF_SHEET)
 PROCESS_MACHINE_CATALOG_RESOLVED = build_process_machine_catalog(DATAFRAME)
 PROCESS_SERVER_COUNT_RESOLVED = build_process_server_counts(PROCESS_MACHINE_CATALOG_RESOLVED)
-PROCESS_OPTIONS = sorted(v for v in DATAFRAME["process"].dropna().unique().tolist() if str(v).strip() and str(v).strip().upper() != "UNKNOWN")
+PROCESS_OPTIONS = (
+    sorted(v for v in DATAFRAME["process"].dropna().unique().tolist() if str(v).strip() and str(v).strip().upper() != "UNKNOWN")
+    if not DATAFRAME.empty and "process" in DATAFRAME.columns
+    else []
+)
 DEFAULT_PROCESS = "RASPADO" if "RASPADO" in PROCESS_OPTIONS else (PROCESS_OPTIONS[0] if PROCESS_OPTIONS else None)
 DEFAULT_ENERGY_REFERENCE_KWH = get_energy_kwh_reference_for_process(DEFAULT_PROCESS)
 
-if not DATAFRAME.empty and DEFAULT_PROCESS:
+if not DATAFRAME.empty and DEFAULT_PROCESS and "process" in DATAFRAME.columns and "arrival_time" in DATAFRAME.columns:
     proc_df = DATAFRAME[DATAFRAME["process"] == DEFAULT_PROCESS]
     default_start = proc_df["arrival_time"].min().date().isoformat() if proc_df["arrival_time"].notna().any() else None
     default_end = proc_df["arrival_time"].max().date().isoformat() if proc_df["arrival_time"].notna().any() else None

@@ -1,0 +1,15 @@
+services:
+  production-flow-studio:
+    build: .
+    image: empirical-lot-cost-simulator:latest
+    ports:
+      - "8050:8050"
+    environment:
+      SIM_APP_HOST: 0.0.0.0
+      SIM_APP_PORT: 8050
+      # Optional: mount a default workbook at ./data/production.xlsx.
+      RASPADO_XLSX_PATH: /app/data/production.xlsx
+      ENERGY_REF_XLSX_PATH: /app/data/energy.xlsx
+    volumes:
+      - ./outputs/uploads:/app/outputs/uploads
+      - ./data:/app/data:ro

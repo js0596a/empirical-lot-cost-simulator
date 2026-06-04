@@ -19,3 +19,16 @@ node_modules/
 
 # Notebook / checkpoints
 .ipynb_checkpoints/
+
+# Generated analysis/output artifacts
+outputs/
+data/
+
+# Local spreadsheet/data artifacts
+*.xlsx
+*.xls
+*.csv
+raspado_findings_payload.json
+node_modules
+secado_app.py
+secado_app_secado_backup.py
