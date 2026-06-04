@@ -1,8 +1,8 @@
 # Production Flow Decision Studio
 
-Dash + SimPy application for production-flow simulation, cost modeling, and process analysis in a leather manufacturing setting.
+Dash + SimPy application for production-flow simulation, cost modeling, queueing analysis, and statistical process analysis in a leather manufacturing setting.
 
-This project was built during my first operations research / data science role in a production plant. The plant had useful timing data in Excel logbooks, but those files were difficult to use for planning. I built this app to clean the records, let a user enter lots and process routes, simulate how those lots move through the plant, and summarize the expected time, cost, and bottlenecks.
+This project reflects work from my first operations research / data science role in a production plant. The plant had useful timing data in Excel logbooks, but those files were difficult to use for planning. I built Python dashboards and simulation workflows to transform raw production logs into operational insights on throughput, bottlenecks, machine capacity, and process costs.
 
 No production workbooks or proprietary plant data are included in this repository.
 
@@ -14,31 +14,28 @@ The app turns raw production logbook data into an interactive planning workflow:
 2. Clean and standardize process, timestamp, machine, and piece-count fields.
 3. Enter lots, piece counts, repeats, and process routes.
 4. Simulate lot movement through plant processes using SimPy.
-5. Review timeline, cost, bottleneck, SPC, capability, and Bayesian classifier outputs.
+5. Review timeline, throughput, bottlenecks, machine capacity, process cost, SPC, capability, and Bayesian classifier outputs.
 
-The main goal was to connect data cleaning, operations research, and business reporting in one tool that a non-technical plant user could operate.
+The main goal was to connect data cleaning, EDA, queueing simulation, statistical process control, and business reporting in one tool that a non-technical plant user could operate.
 
 ## What I Worked On
 
-- Built a Dash application with Plotly charts and Dash Mantine Components.
-- Cleaned Excel production records and standardized process names.
-- Engineered service-time metrics from start and finish timestamps.
-- Performed per-process EDA to identify outliers, timing patterns, and data-quality issues.
-- Implemented a SimPy simulation where users define lot size and process route.
+- Built Python dashboards and simulation workflows to transform raw production logs into operational insights on throughput, bottlenecks, machine capacity, and process costs.
+- Performed EDA, data cleaning, and statistical modeling on plant process data to support queueing analysis, capability studies, and production planning decisions.
+- Developed OR/data science tools for queueing simulation, control charts, process capability analysis, and Bayesian process classification.
+- Engineered service-time metrics from start and finish timestamps and standardized process names across Excel logbooks.
 - Modeled process capacity using machine/server counts and process-specific business rules.
 - Estimated energy, labor, and drying gas costs from simulated operating time.
 - Added Gantt charts to visualize how lots move through the plant over time.
-- Added SPC charts and process capability metrics (`Cp`, `Cpk`, `Pp`, `Ppk`).
-- Added a Bayesian service-time classifier to compare process behavior.
 - Dockerized the app for repeatable local deployment.
 
 ## Business Questions the App Helps Answer
 
 - How long will a proposed set of lots take to move through the plant?
 - Which process is the main cost driver?
-- Which route creates the longest lead time?
+- Which route creates the longest lead time or bottleneck?
 - How do labor, energy, and gas costs change by lot mix?
-- Which processes show unstable or unusual timing behavior?
+- Which processes show unstable, unusual, or out-of-spec timing behavior?
 - Are process times within user-defined lower and upper specification limits?
 
 ## Data Pipeline
@@ -215,10 +212,10 @@ ENERGY_REF_SHEET=Hoja1
 
 - Operations research simulation
 - Production process EDA
-- Queueing and capacity analysis
+- Queueing analysis and capacity modeling
 - Data cleaning from Excel-based operational records
 - Cost modeling for plant processes
-- Statistical process control and capability analysis
+- Statistical process control, Cp/Cpk, and Pp/Ppk capability analysis
 - Interactive dashboard development with Dash and Plotly
 - Docker-based local deployment
 
