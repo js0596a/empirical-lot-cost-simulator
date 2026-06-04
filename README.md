@@ -6,6 +6,16 @@ This project reflects work from my first operations research / data science role
 
 No production workbooks or proprietary plant data are included in this repository.
 
+## Quick Look
+
+Screenshots below use a synthetic demo workbook. No production workbooks or proprietary plant data are included.
+
+![Workflow input](docs/screenshots/01-workflow-input.png)
+
+![Simulation results](docs/screenshots/02-simulation-results.png)
+
+![SPC and capability view](docs/screenshots/03-spc-capability.png)
+
 ## Project Summary
 
 The app turns raw production logbook data into an interactive planning workflow:
