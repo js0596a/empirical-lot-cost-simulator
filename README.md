@@ -1,41 +1,89 @@
-# Raspado EDA Dash App
+# Production Flow Decision Studio
 
-Interactive Dash app with Plotly + Dash Mantine Components for process-level EDA, starting with **RASPADO**.
+A Dash + Plotly + SimPy operations research app for production-flow simulation, cost modeling, SPC/capability analysis, and Bayesian process classification.
 
-## Run
+The product workflow is simple:
+
+1. Upload one or more Excel production logbooks.
+2. Enter lots, pieces, and process routes.
+3. Simulate plant flow and compare cost, time, capacity, bottlenecks, and process risk.
+
+## Features
+
+- Multi-file Excel upload for production time records / production logbooks.
+- Empirical SimPy simulation for lot routing across multiple plant processes.
+- Parallel machine flow with Gantt timeline output.
+- Energy, labor, and drying gas cost estimates by process.
+- Executive decision summary with total cost, cost per piece, lead time, and top cost driver.
+- SPC control charts and capability analysis with `Cp`, `Cpk`, `Pp`, `Ppk`, `LSL`, and `USL`.
+- Bayesian service-time classifier for comparing process labels.
+- Product-style CSS formatting through `assets/studio.css`.
+
+## Local Run
 
 ```bash
-cd /Users/jeslgdo/Documents/Codex/2026-05-28/yo
 python3 -m pip install -r requirements.txt
-python3 app.py
+SIM_APP_PORT=8050 python3 -u new_sim_app.py
 ```
 
-Open: [http://127.0.0.1:8050](http://127.0.0.1:8050)
+Open [http://127.0.0.1:8050](http://127.0.0.1:8050).
 
-## Data source
+If no default workbook exists locally, the app still starts and lets the user upload Excel files from the UI.
 
-By default the app reads:
+## Docker Run
 
-`/Users/jeslgdo/Downloads/datos_raspado.xlsx` (sheet `BITACORA`)
-
-Override with env vars:
+Build and run with Docker:
 
 ```bash
-export RASPADO_XLSX_PATH="/absolute/path/to/your_file.xlsx"
-export RASPADO_SHEET="BITACORA"
-python3 app.py
+docker build -t empirical-lot-cost-simulator .
+docker run --rm -p 8050:8050 empirical-lot-cost-simulator
 ```
 
-## What you get
+Open [http://127.0.0.1:8050](http://127.0.0.1:8050).
 
-- Filter panel (date range, machine, operator, client)
-- Data-engineering controls:
-  - outlier method (`IQR`, `Z-score`, `Quantile`)
-  - outlier view (`Include`, `Exclude`, `Only outliers`)
-  - strict preprocessing toggle (remove missing/invalid rows)
-- Raspado machine catalog enforcement: official machines are `2, 3, 4, 5`
-- KPI cards: lots, mean service, P90 wait, arrival rate, utilization, outlier rate
-- Flow tab: arrivals by hour, cumulative arrivals, interarrival histogram
-- Time Behavior tab: distribution selector, service by machine, wait by operator
-- Capacity tab: pieces vs service, daily throughput/workload, top delayed lots
-- Data Quality tab: preprocessing diagnostics + outlier audit table
+## Docker Compose
+
+```bash
+docker compose up --build
+```
+
+Optional local data mount:
+
+```text
+./data/production.xlsx -> /app/data/production.xlsx
+./data/energy.xlsx     -> /app/data/energy.xlsx
+```
+
+The app also supports uploading Excel workbooks directly through the browser.
+
+## Expected Excel Inputs
+
+The parser looks for production logbook/time-record fields such as:
+
+- `FECHA`
+- `FECHA INICIAL`
+- `FECHA FINAL`
+- `PROCESO`
+- `MAQUINA`
+- `PIEZAS`
+- `OPERADOR`
+
+Spanish naming notes:
+
+- `TIEMPOS` means `Times` or `Time Records`.
+- `BITACORA` / `BITÁCORA` means `Logbook`, here best described as `Production Logbook`.
+
+## Environment Variables
+
+```bash
+SIM_APP_HOST=127.0.0.1        # Use 0.0.0.0 in Docker
+SIM_APP_PORT=8050
+RASPADO_XLSX_PATH=/path/to/default_workbook.xlsx
+RASPADO_SHEET=TIEMPOS
+ENERGY_REF_XLSX_PATH=/path/to/energy_reference.xlsx
+ENERGY_REF_SHEET=Hoja1
+```
+
+## Notes
+
+Generated uploads and analysis outputs are intentionally ignored by Git. Keep sensitive plant data outside the repository.
