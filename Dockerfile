@@ -4,7 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     SIM_APP_HOST=0.0.0.0 \
-    SIM_APP_PORT=8050
+    SIM_APP_PORT=8050 \
+    RASPADO_XLSX_PATH=/app/data/production.xlsx \
+    ENERGY_REF_XLSX_PATH=/app/data/energy.xlsx
 
 WORKDIR /app
 

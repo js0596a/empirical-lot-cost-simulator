@@ -340,6 +340,14 @@ def current_date_range() -> list[str | None]:
     return [dts.min().date().isoformat(), dts.max().date().isoformat()]
 
 
+def initial_data_source_status() -> tuple[str, str]:
+    if core.DATA_ERROR and not os.path.exists(str(core.DATA_PATH)):
+        return "No default workbook loaded. Upload one or more Excel production logbooks to start.", "blue"
+    if core.DATA_ERROR:
+        return str(core.DATA_ERROR), "red"
+    return f"Data source: {core.DATA_PATH}", "teal"
+
+
 def default_route_for_options(options: list[str]) -> list[str]:
     preferred = [x for x in ["RASPADO", "BAUCE", "VACIO"] if x in options]
     if preferred:
@@ -996,8 +1004,8 @@ mini_app.layout = dmc.MantineProvider(
                 dcc.Store(id="sim-history-store", data=[], storage_type="memory"),
                 dmc.Alert(
                     id="data-source-alert",
-                    children=core.DATA_ERROR if core.DATA_ERROR else f"Data source: {core.DATA_PATH}",
-                    color="red" if core.DATA_ERROR else "teal",
+                    children=initial_data_source_status()[0],
+                    color=initial_data_source_status()[1],
                     variant="light",
                     className="source-alert",
                 ),
