@@ -24,15 +24,31 @@ The app turns raw production logbook data into an interactive planning workflow:
 2. Clean and standardize process, timestamp, machine, and piece-count fields.
 3. Enter lots, piece counts, repeats, and process routes.
 4. Simulate lot movement through plant processes using SimPy.
-5. Review timeline, throughput, bottlenecks, machine capacity, process cost, SPC, capability, and Bayesian classifier outputs.
+5. Compare scheduling policies under stochastic process times.
+6. Review simulation results through separate tabs for scheduling, cost, timeline, SPC, capability, and Bayesian process classification.
 
 The main goal was to connect data cleaning, EDA, queueing simulation, statistical process control, and business reporting in one tool that a non-technical plant user could operate.
+
+## Dashboard Workflow
+
+The main app is organized around a plant-user workflow:
+
+| Tab | Purpose |
+| --- | --- |
+| Simulation | Shows configured lots, process cost, total cost, and the Gantt timeline for the simulated production flow. |
+| Scheduling | Compares FIFO, due-date, processing-time, priority, and slack-based policies across repeated stochastic simulations. |
+| SPC / Capability | Provides control charts, histograms, and Cp/Cpk/Pp/Ppk capability metrics when LSL/USL are supplied. |
+| Bayesian | Classifies whether an observed process time resembles one selected process or another based on historical timing data. |
+| References | Shows fixed reference assumptions such as energy consumption and drying temperature values. |
+
+The input area stays at the top of the app so the user can add lots, choose a route, set due time and priority, and then evaluate the results without scrolling through one long report.
 
 ## What I Worked On
 
 - Built Python dashboards and simulation workflows to transform raw production logs into operational insights on throughput, bottlenecks, machine capacity, and process costs.
 - Performed EDA, data cleaning, and statistical modeling on plant process data to support queueing analysis, capability studies, and production planning decisions.
 - Developed data science tools for queueing simulation, control charts, process capability analysis, and Bayesian process classification.
+- Added stochastic scheduling policy comparison for FIFO, EDD, SPT, LPT, priority, minimum slack, and weighted slack rules.
 - Engineered service-time metrics from start and finish timestamps and standardized process names across Excel logbooks.
 - Modeled process capacity using machine/server counts and process-specific business rules.
 - Estimated energy, labor, and drying gas costs from simulated operating time.
@@ -44,6 +60,8 @@ The main goal was to connect data cleaning, EDA, queueing simulation, statistica
 - How long will a proposed set of lots take to move through the plant?
 - Which process is the main cost driver?
 - Which route creates the longest lead time or bottleneck?
+- Which scheduling policy gives the best expected completion time or lowest lateness risk?
+- How do release timing, capacity, and lot splitting assumptions affect lead-time risk?
 - How do labor, energy, and gas costs change by lot mix?
 - Which processes show unstable, unusual, or out-of-spec timing behavior?
 - Are process times within user-defined lower and upper specification limits?
@@ -95,6 +113,39 @@ Simulation outputs include:
 - Gantt timeline
 
 A random uniform transfer/setup gap is added between process steps to avoid identical deterministic runs while keeping the delay inside a realistic operating range.
+
+## Stochastic Scheduling Extension
+
+The app includes a scheduling policy comparison layer for production planning. The user can assign each lot:
+
+- Due time from release
+- Business priority
+- Pieces
+- Process route
+
+The simulator can compare dispatching/release policies such as:
+
+- FIFO: first lot released first
+- EDD: earliest due date first
+- SPT: shortest expected processing time first
+- LPT: longest expected processing time first
+- Priority: highest business priority first
+- Minimum slack: lot closest to being late first
+- Weighted slack: slack adjusted by priority
+
+Each policy is simulated repeatedly using stochastic process times from the cleaned empirical data. The comparison returns:
+
+- Expected completion time
+- P90 completion time
+- Expected lead time
+- P90 lead time
+- Probability that at least one lot is late
+- Percent of late lots
+- Expected cost
+- P90 cost
+- Bottleneck by queue wait and utilization
+
+This keeps the app useful for operations research planning: instead of only simulating one schedule, the user can compare policies under uncertainty before choosing a release plan.
 
 ## Cost Model
 
@@ -175,6 +226,8 @@ http://127.0.0.1:8050
 ```
 
 ## Run with Docker
+
+The current Docker setup still works for the latest app changes. The scheduling and tabbed-layout updates are code-level changes inside `new_sim_app.py`; no new Python packages, startup command, or Dockerfile changes are required. Rebuild the image when you want the container to include the newest code.
 
 Build the image:
 

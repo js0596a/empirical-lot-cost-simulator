@@ -26,11 +26,15 @@ def build_lot_rows(lot_store: list[dict]) -> list[dict]:
     for i, lot in enumerate(lot_store, start=1):
         route = [str(p).strip() for p in lot.get("route", []) if str(p).strip()]
         pieces = pd.to_numeric(pd.Series([lot.get("pieces")]), errors="coerce").iloc[0]
+        due_h = pd.to_numeric(pd.Series([lot.get("due_h")]), errors="coerce").iloc[0]
+        priority = pd.to_numeric(pd.Series([lot.get("priority")]), errors="coerce").iloc[0]
         rows.append(
             {
                 "lot_id": i,
                 "lot_name": str(lot.get("lot_name", f"Lote_{i}")),
                 "pieces": round(float(pieces), 2) if pd.notna(pieces) else None,
+                "due_h": round(float(due_h), 2) if pd.notna(due_h) else None,
+                "priority": int(priority) if pd.notna(priority) else 1,
                 "steps": int(len(route)),
                 "route": " > ".join(route),
             }
@@ -286,6 +290,16 @@ SPC_METRIC_OPTIONS = {
     "wait_hours": "Queue wait (hours)",
     "cycle_hours": "Cycle time (hours)",
 }
+SCHEDULING_POLICY_OPTIONS = [
+    {"label": "FIFO - first lot released first", "value": "FIFO"},
+    {"label": "EDD - earliest due date first", "value": "EDD"},
+    {"label": "SPT - shortest expected processing time first", "value": "SPT"},
+    {"label": "LPT - longest expected processing time first", "value": "LPT"},
+    {"label": "Priority - highest priority first", "value": "PRIORITY"},
+    {"label": "Minimum slack - closest to late first", "value": "MIN_SLACK"},
+    {"label": "Weighted slack - slack adjusted by priority", "value": "WEIGHTED_SLACK"},
+]
+SCHEDULING_POLICY_LABELS = {item["value"]: item["label"].split(" - ")[0] for item in SCHEDULING_POLICY_OPTIONS}
 SPC_METRIC_TO_MIN = {
     "service_hours": "service_min",
     "wait_hours": "wait_min",
@@ -542,6 +556,434 @@ def build_drying_temperature_rows() -> list[dict]:
         temp_c = get_drying_temperature_c(proc)
         rows.append({"process": proc, "temperature_c": temp_c})
     return rows
+
+
+def coerce_numeric(value: object, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        out = float(default)
+    if not np.isfinite(out):
+        out = float(default)
+    if minimum is not None:
+        out = max(float(minimum), out)
+    if maximum is not None:
+        out = min(float(maximum), out)
+    return float(out)
+
+
+def normalize_lot_store_for_simulation(lot_store: list[dict] | None) -> list[dict]:
+    lots_raw = list(lot_store) if isinstance(lot_store, list) else []
+    lots: list[dict] = []
+    for i, lot in enumerate(lots_raw, start=1):
+        route = normalize_sim_route(lot.get("route", []))
+        pieces = pd.to_numeric(pd.Series([lot.get("pieces")]), errors="coerce").iloc[0]
+        if route and pd.notna(pieces) and float(pieces) > 0:
+            lots.append(
+                {
+                    "lot_name": str(lot.get("lot_name", f"Lote_{i}")),
+                    "pieces": float(pieces),
+                    "due_h": coerce_numeric(lot.get("due_h"), 48.0, minimum=0.01, maximum=1000.0),
+                    "priority": int(round(coerce_numeric(lot.get("priority"), 1.0, minimum=1.0, maximum=99.0))),
+                    "route": list(route),
+                    "original_order": int(i),
+                }
+            )
+    return lots
+
+
+def ordered_processes_from_lots(lots: list[dict]) -> list[str]:
+    ordered: list[str] = []
+    for lot in lots:
+        for proc in lot.get("route", []):
+            if proc not in ordered:
+                ordered.append(str(proc))
+    return ordered
+
+
+def filter_base_for_date_range(date_range: list[str] | None) -> pd.DataFrame:
+    base = core.DATAFRAME.copy()
+    if date_range and len(date_range) == 2 and date_range[0] and date_range[1]:
+        start = pd.to_datetime(date_range[0], errors="coerce")
+        end = pd.to_datetime(date_range[1], errors="coerce")
+        if pd.notna(start) and pd.notna(end):
+            base = base[(base["arrival_time"] >= start) & (base["arrival_time"] <= end + pd.Timedelta(days=1))].copy()
+    return base
+
+
+def build_fifo_stage_catalog(base: pd.DataFrame, lots: list[dict], recurtido_hours: object, rng: np.random.Generator) -> tuple[dict, list[str]]:
+    ordered_processes = ordered_processes_from_lots(lots)
+    ordered_empirical_processes = [p for p in ordered_processes if p != RECURTIDO_PROCESS]
+    stage_catalog, missing_processes = core.build_stage_catalog_for_processes(
+        base_df=base,
+        process_list=ordered_empirical_processes,
+        strict_cleaning=True,
+        queue_use_downtime=True,
+        rng=rng,
+        rate_iqr_filter=False,
+        rate_iqr_processes=SECADO_RATE_IQR_FILTER_PROCESSES,
+        rate_tail_guardrail=False,
+        rate_tail_guardrail_processes=SECADO_RATE_IQR_FILTER_PROCESSES,
+        no_piece_scaling_processes=SECADO_NO_PIECE_SCALING_PROCESSES,
+        service_hour_caps=SECADO_SERVICE_HOUR_CAPS,
+        service_range_guardrail=True,
+    )
+    if RECURTIDO_PROCESS in ordered_processes:
+        stage_catalog[RECURTIDO_PROCESS] = build_recurtido_stage_spec(recurtido_hours)
+    return stage_catalog, missing_processes
+
+
+def filter_lots_to_stage_catalog(lots: list[dict], stage_catalog: dict) -> list[dict]:
+    filtered: list[dict] = []
+    for lot in lots:
+        route = [p for p in lot.get("route", []) if p in stage_catalog]
+        if route:
+            filtered.append(
+                {
+                    "lot_name": lot["lot_name"],
+                    "pieces": float(lot["pieces"]),
+                    "route": route,
+                    "due_h": coerce_numeric(lot.get("due_h"), 48.0, minimum=0.01),
+                    "priority": int(round(coerce_numeric(lot.get("priority"), 1.0, minimum=1.0, maximum=99.0))),
+                    "original_order": int(lot.get("original_order", len(filtered) + 1)),
+                }
+            )
+    return filtered
+
+
+def estimate_lot_processing_h(lot: dict, stage_catalog: dict) -> float:
+    total = 0.0
+    for proc in lot.get("route", []):
+        spec = stage_catalog.get(proc, {})
+        mean_h = coerce_numeric(spec.get("mean_service_h_empirical"), 0.0, minimum=0.0)
+        if mean_h <= 0:
+            lo = coerce_numeric(spec.get("service_min_h"), 0.0, minimum=0.0)
+            hi = coerce_numeric(spec.get("service_max_h"), lo, minimum=0.0)
+            mean_h = (lo + hi) / 2.0 if hi >= lo else lo
+        total += max(0.0, mean_h)
+    return float(total)
+
+
+def order_lots_by_scheduling_policy(lots: list[dict], stage_catalog: dict, policy: str | None) -> list[dict]:
+    policy_key = str(policy or "FIFO").strip().upper()
+    decorated: list[tuple[tuple, dict]] = []
+    for idx, lot in enumerate(lots):
+        lot_copy = dict(lot)
+        original_order = int(lot_copy.get("original_order", idx + 1))
+        due_h = coerce_numeric(lot_copy.get("due_h"), 48.0, minimum=0.01)
+        priority = coerce_numeric(lot_copy.get("priority"), 1.0, minimum=1.0, maximum=99.0)
+        expected_processing_h = estimate_lot_processing_h(lot_copy, stage_catalog)
+        slack_h = due_h - expected_processing_h
+
+        if policy_key == "EDD":
+            key = (due_h, original_order)
+        elif policy_key == "SPT":
+            key = (expected_processing_h, original_order)
+        elif policy_key == "LPT":
+            key = (-expected_processing_h, original_order)
+        elif policy_key == "PRIORITY":
+            key = (-priority, original_order)
+        elif policy_key == "MIN_SLACK":
+            key = (slack_h, original_order)
+        elif policy_key == "WEIGHTED_SLACK":
+            key = (slack_h / max(priority, 1e-6), original_order)
+        else:
+            key = (original_order,)
+
+        lot_copy["due_h"] = due_h
+        lot_copy["priority"] = int(round(priority))
+        lot_copy["expected_processing_h"] = expected_processing_h
+        lot_copy["slack_h"] = slack_h
+        decorated.append((key, lot_copy))
+
+    return [lot for _key, lot in sorted(decorated, key=lambda item: item[0])]
+
+
+def copy_stage_catalog_with_capacity(stage_catalog: dict, capacity_delta: int = 0) -> dict:
+    adjusted: dict = {}
+    delta = int(max(0, capacity_delta or 0))
+    for proc, spec in stage_catalog.items():
+        spec_copy = dict(spec)
+        base_servers = int(max(1, spec_copy.get("servers", 1) or 1))
+        servers = int(max(1, base_servers + delta))
+        labels = [str(x) for x in spec_copy.get("machine_labels", []) if str(x).strip()]
+        if not labels:
+            labels = [str(i) for i in range(1, servers + 1)]
+        while len(labels) < servers:
+            labels.append(str(len(labels) + 1))
+        spec_copy["servers"] = servers
+        spec_copy["machine_labels"] = labels[:servers]
+        adjusted[proc] = spec_copy
+    return adjusted
+
+
+def split_large_lots_for_scenario(lots: list[dict], threshold_pieces: float | int | None) -> list[dict]:
+    threshold = coerce_numeric(threshold_pieces, 0.0, minimum=0.0)
+    if threshold <= 0:
+        return [dict(lot) for lot in lots]
+
+    split_lots: list[dict] = []
+    for lot in lots:
+        pieces = coerce_numeric(lot.get("pieces"), 0.0, minimum=0.0)
+        if pieces <= threshold:
+            split_lots.append(dict(lot))
+            continue
+
+        chunks = int(max(1, min(100, np.ceil(pieces / threshold))))
+        remaining = pieces
+        for chunk_idx in range(1, chunks + 1):
+            chunk_pieces = pieces / chunks if chunk_idx < chunks else remaining
+            remaining -= chunk_pieces
+            split_lots.append(
+                {
+                    "lot_name": f"{lot['lot_name']}.{chunk_idx}",
+                    "pieces": float(max(1e-6, chunk_pieces)),
+                    "route": list(lot.get("route", [])),
+                    "due_h": coerce_numeric(lot.get("due_h"), 48.0, minimum=0.01, maximum=1000.0),
+                    "priority": int(round(coerce_numeric(lot.get("priority"), 1.0, minimum=1.0, maximum=99.0))),
+                    "original_order": int(lot.get("original_order", len(split_lots) + 1)),
+                    "parent_lot": lot.get("lot_name"),
+                }
+            )
+    return split_lots
+
+
+def fifo_release_interarrivals(n_lots: int, release_policy: str, spacing_h: float) -> np.ndarray:
+    n = int(max(0, n_lots))
+    if n == 0:
+        return np.array([], dtype=float)
+    interarrivals = np.full(n, 1e-6, dtype=float)
+    if str(release_policy).lower() == "staggered" and n > 1:
+        interarrivals[1:] = max(1e-6, float(spacing_h))
+    return interarrivals
+
+
+def summarize_fifo_simulation(
+    sim: dict,
+    stage_catalog: dict,
+    due_h: float,
+    energy_cost: float,
+    labor_cost: float,
+    gas_cost_per_cuero_50c: float,
+    due_by_lot: dict[str, float] | None = None,
+) -> dict:
+    stage_events = pd.DataFrame(sim.get("stage_rows", []))
+    lot_events = pd.DataFrame(sim.get("lot_rows", []))
+    if stage_events.empty or lot_events.empty:
+        return {}
+
+    total_energy_cost = 0.0
+    total_labor_cost = 0.0
+    total_gas_cost = 0.0
+    for proc, g in stage_events.groupby("process"):
+        srv = pd.to_numeric(g["service_h"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        dt = pd.to_numeric(g["downtime_h"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        pieces_total = float(pd.to_numeric(g.get("pieces", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
+        machine_hours = float(np.nansum(srv) + np.nansum(dt))
+        proc_kwh, _source = get_process_kwh(str(proc))
+        total_energy_cost += float(machine_hours * proc_kwh * energy_cost)
+        total_labor_cost += float(np.nansum(srv) * labor_cost)
+
+        temp_c = get_drying_temperature_c(str(proc))
+        if temp_c is not None:
+            temp_factor = float(max(0.0, temp_c) / max(1e-6, GAS_REFERENCE_TEMP_C))
+            total_gas_cost += float(max(0.0, pieces_total) * gas_cost_per_cuero_50c * temp_factor)
+
+    finish_h_raw = pd.to_numeric(lot_events.get("system_finish_h", pd.Series(dtype=float)), errors="coerce")
+    finish_h = finish_h_raw.dropna()
+    lead_h = pd.to_numeric(lot_events.get("system_time_h", pd.Series(dtype=float)), errors="coerce").dropna()
+    wait_h = pd.to_numeric(stage_events.get("wait_h", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    service_h = pd.to_numeric(stage_events.get("service_h", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    pieces_total = float(pd.to_numeric(lot_events.get("pieces", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
+
+    due_valid = np.isfinite(due_h) and due_h > 0
+    if due_by_lot and "lot_name" in lot_events.columns:
+        due_series = lot_events["lot_name"].astype(str).map(due_by_lot)
+        if due_valid:
+            due_series = due_series.fillna(float(due_h))
+        late_frame = pd.DataFrame({"finish_h": finish_h_raw, "due_h": pd.to_numeric(due_series, errors="coerce")}).dropna()
+        late_flags = late_frame["finish_h"] > late_frame["due_h"] if not late_frame.empty else pd.Series(False, dtype=bool)
+    else:
+        late_flags = (finish_h > due_h) if due_valid and not finish_h.empty else pd.Series(False, index=finish_h.index)
+    wait_by_proc = stage_events.assign(wait_h=wait_h).groupby("process")["wait_h"].sum().sort_values(ascending=False)
+    service_by_proc = stage_events.assign(service_h=service_h).groupby("process")["service_h"].sum().sort_values(ascending=False)
+    bottleneck_wait = str(wait_by_proc.index[0]) if not wait_by_proc.empty and wait_by_proc.iloc[0] > 1e-9 else ""
+    bottleneck_service = str(service_by_proc.index[0]) if not service_by_proc.empty else ""
+    bottleneck = bottleneck_wait or bottleneck_service
+
+    makespan = float(finish_h.max()) if not finish_h.empty else np.nan
+    total_cost = float(total_energy_cost + total_labor_cost + total_gas_cost)
+    utilization_rows = []
+    for proc, g in stage_events.groupby("process"):
+        spec = stage_catalog.get(str(proc), {})
+        servers = int(max(1, spec.get("servers", 1) or 1))
+        service_total = float(pd.to_numeric(g.get("service_h"), errors="coerce").fillna(0.0).sum())
+        util = float(service_total / (servers * makespan)) if np.isfinite(makespan) and makespan > 0 else np.nan
+        if np.isfinite(util):
+            utilization_rows.append((str(proc), util))
+    bottleneck_util = max(utilization_rows, key=lambda x: x[1])[0] if utilization_rows else bottleneck
+
+    return {
+        "makespan_h": makespan,
+        "lead_mean_h": float(lead_h.mean()) if not lead_h.empty else np.nan,
+        "lead_p90_h": float(np.nanquantile(lead_h, 0.90)) if not lead_h.empty else np.nan,
+        "wait_mean_h": float(wait_h.mean()) if len(wait_h) else np.nan,
+        "wait_p90_h": float(np.nanquantile(wait_h, 0.90)) if len(wait_h) else np.nan,
+        "late_any": bool(late_flags.any()) if len(late_flags) else False,
+        "late_lot_pct": float(late_flags.mean() * 100.0) if len(late_flags) else 0.0,
+        "total_cost": total_cost,
+        "cost_per_piece": float(total_cost / pieces_total) if pieces_total > 0 else np.nan,
+        "bottleneck": bottleneck,
+        "bottleneck_util": bottleneck_util,
+        "lots": int(len(lot_events)),
+        "pieces_total": pieces_total,
+    }
+
+
+def run_fifo_scenario_batch(
+    stage_catalog: dict,
+    base_lots: list[dict],
+    scenario: dict,
+    reps: int,
+    due_h: float,
+    energy_cost: float,
+    labor_cost: float,
+    gas_cost_per_cuero_50c: float,
+    rng: np.random.Generator,
+) -> dict:
+    metrics: list[dict] = []
+    capacity_delta = int(max(0, scenario.get("capacity_delta", 0) or 0))
+    release_policy = str(scenario.get("release_policy", "parallel"))
+    scheduling_policy = str(scenario.get("scheduling_policy", "FIFO")).strip().upper()
+    release_spacing_h = coerce_numeric(scenario.get("release_spacing_h"), 0.5, minimum=1e-6)
+    split_threshold = scenario.get("split_threshold")
+    lots_for_policy = split_large_lots_for_scenario(base_lots, split_threshold) if scenario.get("split") else [dict(l) for l in base_lots]
+
+    for _rep in range(int(max(1, reps))):
+        policy_catalog = copy_stage_catalog_with_capacity(stage_catalog, capacity_delta=capacity_delta)
+        ordered_lots = order_lots_by_scheduling_policy(lots_for_policy, policy_catalog, scheduling_policy)
+        due_by_lot = {
+            str(lot.get("lot_name")): coerce_numeric(lot.get("due_h"), due_h, minimum=0.01)
+            for lot in ordered_lots
+        }
+        interarrivals = fifo_release_interarrivals(len(ordered_lots), release_policy, release_spacing_h)
+        between_steps_gap_sampler = lambda: float(rng.uniform(low=(20.0 / 60.0), high=(30.0 / 60.0)))
+        sim = core.simulate_lot_plan_flow(
+            stage_catalog=policy_catalog,
+            lot_plan=ordered_lots,
+            interarrival_h=interarrivals,
+            between_steps_gap_sampler=between_steps_gap_sampler,
+            use_resource_queue=True,
+        )
+        one = summarize_fifo_simulation(
+            sim=sim,
+            stage_catalog=policy_catalog,
+            due_h=due_h,
+            energy_cost=energy_cost,
+            labor_cost=labor_cost,
+            gas_cost_per_cuero_50c=gas_cost_per_cuero_50c,
+            due_by_lot=due_by_lot,
+        )
+        if one:
+            metrics.append(one)
+
+    if not metrics:
+        return {"scenario": scenario.get("name", "Scenario"), "status": "No valid simulation events"}
+
+    frame = pd.DataFrame(metrics)
+    bottleneck_values = frame["bottleneck"].dropna().astype(str)
+    bottleneck_util_values = frame["bottleneck_util"].dropna().astype(str)
+    bottleneck_mode = bottleneck_values.mode().iloc[0] if not bottleneck_values.empty else ""
+    bottleneck_util_mode = bottleneck_util_values.mode().iloc[0] if not bottleneck_util_values.empty else bottleneck_mode
+    lots_mean = float(frame["lots"].mean()) if "lots" in frame else float(len(lots_for_policy))
+    pieces_total = float(frame["pieces_total"].mean()) if "pieces_total" in frame else sum(float(l["pieces"]) for l in lots_for_policy)
+
+    return {
+        "scenario": str(scenario.get("name", "Scenario")),
+        "fifo_rule": "Preserved at each process",
+        "reps": int(len(frame)),
+        "scheduling_policy": SCHEDULING_POLICY_LABELS.get(scheduling_policy, scheduling_policy),
+        "release_policy": "Staggered" if release_policy == "staggered" else "Parallel",
+        "capacity_delta": capacity_delta,
+        "split_policy": "Split large lots" if scenario.get("split") else "No split",
+        "lots_mean": round(lots_mean, 2),
+        "pieces_total": round(pieces_total, 2),
+        "expected_completion_h": round(float(frame["makespan_h"].mean()), 3),
+        "p90_completion_h": round(float(np.nanquantile(frame["makespan_h"], 0.90)), 3),
+        "expected_lead_h": round(float(frame["lead_mean_h"].mean()), 3),
+        "p90_lead_h": round(float(frame["lead_p90_h"].mean()), 3),
+        "p_late_any_pct": round(float(frame["late_any"].astype(float).mean() * 100.0), 2),
+        "late_lot_pct": round(float(frame["late_lot_pct"].mean()), 2),
+        "expected_cost": round(float(frame["total_cost"].mean()), 2),
+        "p90_cost": round(float(np.nanquantile(frame["total_cost"], 0.90)), 2),
+        "expected_cost_per_piece": round(float(frame["cost_per_piece"].mean()), 4),
+        "bottleneck_wait_mode": bottleneck_mode,
+        "bottleneck_util_mode": bottleneck_util_mode,
+    }
+
+
+def build_fifo_risk_figure(rows: list[dict]) -> go.Figure:
+    if not rows:
+        return empty_figure("Run FIFO scenarios")
+    df = pd.DataFrame(rows)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=df["scenario"],
+            y=df["expected_completion_h"],
+            name="Expected completion (h)",
+            marker_color="#2563eb",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=df["scenario"],
+            y=df["p90_completion_h"],
+            name="P90 completion (h)",
+            marker_color="#0f766e",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["scenario"],
+            y=df["p_late_any_pct"],
+            mode="lines+markers",
+            name="P(any late) %",
+            marker_color="#dc2626",
+            line={"width": 3},
+        ),
+        secondary_y=True,
+    )
+    fig.update_yaxes(title_text="Hours", secondary_y=False)
+    fig.update_yaxes(title_text="Late probability (%)", secondary_y=True, range=[0, max(100, float(df["p_late_any_pct"].max()) * 1.15)])
+    fig.update_layout(
+        barmode="group",
+        height=420,
+        margin={"l": 25, "r": 25, "t": 55, "b": 120},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.03, "xanchor": "left", "x": 0},
+    )
+    fig.update_xaxes(tickangle=-25)
+    return core.style_figure(fig, "FIFO completion and lateness risk")
+
+
+def build_fifo_cost_figure(rows: list[dict]) -> go.Figure:
+    if not rows:
+        return empty_figure("Run FIFO scenarios")
+    df = pd.DataFrame(rows)
+    fig = go.Figure()
+    fig.add_bar(x=df["scenario"], y=df["expected_cost"], name="Expected cost", marker_color="#f97316")
+    fig.add_bar(x=df["scenario"], y=df["p90_cost"], name="P90 cost", marker_color="#9333ea")
+    fig.update_layout(
+        barmode="group",
+        height=360,
+        yaxis={"title": "Cost"},
+        margin={"l": 25, "r": 25, "t": 55, "b": 120},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.03, "xanchor": "left", "x": 0},
+    )
+    fig.update_xaxes(tickangle=-25)
+    return core.style_figure(fig, "FIFO cost risk by scenario")
 
 
 def _finite_float(value: object) -> float:
@@ -1130,6 +1572,13 @@ mini_app.layout = dmc.MantineProvider(
                                     dmc.NumberInput(id="lot-repeat", label="Repeats", value=1, min=1, max=500, step=1, allowDecimal=False),
                                 ],
                             ),
+                            dmc.Group(
+                                grow=True,
+                                children=[
+                                    dmc.NumberInput(id="lot-due-hours", label="Due time from release (hours)", value=48, min=0.1, max=1000, step=1, decimalScale=2),
+                                    dmc.NumberInput(id="lot-priority", label="Priority (higher = more urgent)", value=1, min=1, max=99, step=1, allowDecimal=False),
+                                ],
+                            ),
                             dmc.MultiSelect(
                                 id="lot-processes",
                                 label="Processes (ordered; place RECURTIDO wherever you want)",
@@ -1147,6 +1596,15 @@ mini_app.layout = dmc.MantineProvider(
                                 max=240,
                                 step=0.25,
                                 decimalScale=3,
+                            ),
+                            dmc.Select(
+                                id="scheduling-policy",
+                                label="Scheduling policy",
+                                data=SCHEDULING_POLICY_OPTIONS,
+                                value="FIFO",
+                                allowDeselect=False,
+                                searchable=True,
+                                description="Controls the lot release/dispatch priority used before FIFO queues at each process.",
                             ),
                             dmc.Group(
                                 gap="xs",
@@ -1218,382 +1676,547 @@ mini_app.layout = dmc.MantineProvider(
                     radius="lg",
                     p="lg",
                     className="results-panel app-card",
-                    children=dmc.Stack(
-                        gap="sm",
+                    children=dmc.Tabs(
+                        value="simulation",
+                        keepMounted=True,
+                        variant="outline",
+                        radius="md",
                         children=[
-                            dmc.Group(
-                                justify="space-between",
-                                align="center",
+                            dmc.TabsList(
+                                grow=True,
                                 children=[
-                                    dmc.Text("Configured lots", fw=700),
-                                    dmc.Group(
-                                        gap="xs",
+                                    dmc.TabsTab("Simulation", value="simulation"),
+                                    dmc.TabsTab("Scheduling", value="scheduling"),
+                                    dmc.TabsTab("SPC / Capability", value="quality"),
+                                    dmc.TabsTab("Bayesian", value="bayes"),
+                                    dmc.TabsTab("References", value="references"),
+                                ],
+                            ),
+                            dmc.TabsPanel(
+                                value="simulation",
+                                pt="md",
+                                children=dmc.Stack(
+                                    gap="sm",
+                                    children=[
+                                        dmc.Group(
+                                            justify="space-between",
+                                            align="center",
+                                            children=[
+                                                dmc.Stack(
+                                                    gap=2,
+                                                    children=[
+                                                        dmc.Text("Simulation results", fw=800),
+                                                        dmc.Text("Configured lots, cost breakdown, and Gantt timeline for the selected scheduling policy.", c="dimmed", fz="sm"),
+                                                    ],
+                                                ),
+                                                dmc.Group(
+                                                    gap="xs",
+                                                    children=[
+                                                        dmc.Button("Clear lots", id="clear-lots-bottom", color="gray", variant="light", size="xs"),
+                                                        dmc.Button("Clear simulations", id="clear-sim-history", color="gray", variant="outline", size="xs"),
+                                                    ],
+                                                ),
+                                            ],
+                                        ),
+                                        dmc.Select(
+                                            id="sim-toggle-select",
+                                            label="Simulation view",
+                                            data=[],
+                                            value=None,
+                                            placeholder="Run simulation to create history",
+                                            clearable=True,
+                                            searchable=True,
+                                        ),
+                                        dash_table.DataTable(
+                                            id="lot-table",
+                                            columns=[
+                                                {"name": "lot_id", "id": "lot_id"},
+                                                {"name": "lot_name", "id": "lot_name"},
+                                                {"name": "pieces", "id": "pieces"},
+                                                {"name": "due_h", "id": "due_h"},
+                                                {"name": "priority", "id": "priority"},
+                                                {"name": "steps", "id": "steps"},
+                                                {"name": "route", "id": "route"},
+                                            ],
+                                            data=[],
+                                            page_size=8,
+                                            sort_action="native",
+                                            filter_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                        dmc.Text("Cost by process", fw=700),
+                                        dcc.Graph(id="cost-fig", figure=empty_figure("Run simulation"), className="plot-card"),
+                                        dmc.Text("Gantt by timeline", fw=700),
+                                        dcc.Graph(id="gantt-fig", figure=empty_figure("Run simulation"), className="plot-card"),
+                                        dmc.Text("Cost detail", fw=700),
+                                        dash_table.DataTable(
+                                            id="cost-table",
+                                            columns=[
+                                                {"name": "process", "id": "process"},
+                                                {"name": "kwh_per_machine_hour", "id": "kwh_per_machine_hour"},
+                                                {"name": "kwh_source", "id": "kwh_source"},
+                                                {"name": "visits", "id": "visits"},
+                                                {"name": "pieces_total", "id": "pieces_total"},
+                                                {"name": "clean_service_min_h", "id": "clean_service_min_h"},
+                                                {"name": "clean_service_max_h", "id": "clean_service_max_h"},
+                                                {"name": "sim_service_min_h", "id": "sim_service_min_h"},
+                                                {"name": "sim_service_max_h", "id": "sim_service_max_h"},
+                                                {"name": "service_total_h", "id": "service_total_h"},
+                                                {"name": "downtime_total_h", "id": "downtime_total_h"},
+                                                {"name": "gas_temp_c", "id": "gas_temp_c"},
+                                                {"name": "gas_cost_per_cuero", "id": "gas_cost_per_cuero"},
+                                                {"name": "energy_cost", "id": "energy_cost"},
+                                                {"name": "labor_cost", "id": "labor_cost"},
+                                                {"name": "gas_cost", "id": "gas_cost"},
+                                                {"name": "total_cost", "id": "total_cost"},
+                                            ],
+                                            data=[],
+                                            page_size=12,
+                                            sort_action="native",
+                                            filter_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                        dmc.Text("Drying gas detail (LTD, TAIC, AEREO only)", fw=700),
+                                        dash_table.DataTable(
+                                            id="gas-table",
+                                            columns=[
+                                                {"name": "process", "id": "process"},
+                                                {"name": "temperature_c", "id": "temperature_c"},
+                                                {"name": "pieces_total", "id": "pieces_total"},
+                                                {"name": "estimated_gas_cost_per_cuero", "id": "gas_cost_per_cuero"},
+                                                {"name": "gas_cost_total", "id": "gas_cost_total"},
+                                            ],
+                                            data=[],
+                                            page_size=8,
+                                            sort_action="native",
+                                            filter_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                    ],
+                                ),
+                            ),
+                            dmc.TabsPanel(
+                                value="scheduling",
+                                pt="md",
+                                children=dmc.Paper(
+                                    withBorder=True,
+                                    radius="lg",
+                                    p="md",
+                                    className="scenario-panel",
+                                    children=dmc.Stack(
+                                        gap="sm",
                                         children=[
-                                            dmc.Button("Clear lots", id="clear-lots-bottom", color="gray", variant="light", size="xs"),
-                                            dmc.Button("Clear simulations", id="clear-sim-history", color="gray", variant="outline", size="xs"),
+                                            dmc.Group(
+                                                justify="space-between",
+                                                align="center",
+                                                children=[
+                                                    dmc.Stack(
+                                                        gap=2,
+                                                        children=[
+                                                            dmc.Text("Scheduling policy comparison", fw=800),
+                                                            dmc.Text(
+                                                                "Compare dispatching rules with repeated stochastic simulations. FIFO remains the default; other policies use due time, expected workload, and priority.",
+                                                                c="dimmed",
+                                                                fz="sm",
+                                                            ),
+                                                        ],
+                                                    ),
+                                                    dmc.Badge("Monte Carlo", color="grape", variant="light"),
+                                                ],
+                                            ),
+                                            dmc.Alert(
+                                                id="fifo-scenario-summary",
+                                                color="grape",
+                                                variant="light",
+                                                children="Pick policies and run scenario comparison to estimate completion risk, lateness, bottlenecks, and cost.",
+                                            ),
+                                            dmc.MultiSelect(
+                                                id="fifo-policy-select",
+                                                label="Policies to compare",
+                                                data=SCHEDULING_POLICY_OPTIONS,
+                                                value=["FIFO", "EDD", "SPT"],
+                                                searchable=True,
+                                                clearable=False,
+                                            ),
+                                            dmc.Group(
+                                                grow=True,
+                                                children=[
+                                                    dmc.NumberInput(id="fifo-reps", label="Monte Carlo runs", value=50, min=5, max=300, step=5, allowDecimal=False),
+                                                    dmc.Select(
+                                                        id="fifo-release-policy",
+                                                        label="Release plan",
+                                                        data=[
+                                                            {"label": "Release all lots at time 0", "value": "parallel"},
+                                                            {"label": "Stagger releases", "value": "staggered"},
+                                                        ],
+                                                        value="parallel",
+                                                        allowDeselect=False,
+                                                    ),
+                                                    dmc.NumberInput(id="fifo-release-spacing-hours", label="Stagger spacing (hours)", value=0.5, min=0.01, max=48, step=0.25, decimalScale=2),
+                                                ],
+                                            ),
+                                            dmc.Group(
+                                                grow=True,
+                                                children=[
+                                                    dmc.NumberInput(id="fifo-capacity-delta", label="Capacity add-on per process", value=0, min=0, max=5, step=1, allowDecimal=False),
+                                                    dmc.NumberInput(id="fifo-split-threshold-pieces", label="Split lots above pieces (0 = off)", value=0, min=0, max=100000, step=50, allowDecimal=False),
+                                                    dmc.Button("Compare policies", id="run-fifo-scenarios", color="grape", mt=24),
+                                                ],
+                                            ),
+                                            dcc.Graph(id="fifo-risk-fig", figure=empty_figure("Run FIFO policy comparison"), className="plot-card"),
+                                            dcc.Graph(id="fifo-cost-risk-fig", figure=empty_figure("Run FIFO policy comparison"), className="plot-card"),
+                                            dash_table.DataTable(
+                                                id="fifo-scenario-table",
+                                                columns=[
+                                                    {"name": "scenario", "id": "scenario"},
+                                                    {"name": "fifo_rule", "id": "fifo_rule"},
+                                                    {"name": "reps", "id": "reps"},
+                                                    {"name": "scheduling_policy", "id": "scheduling_policy"},
+                                                    {"name": "release_policy", "id": "release_policy"},
+                                                    {"name": "capacity_delta", "id": "capacity_delta"},
+                                                    {"name": "split_policy", "id": "split_policy"},
+                                                    {"name": "lots_mean", "id": "lots_mean"},
+                                                    {"name": "pieces_total", "id": "pieces_total"},
+                                                    {"name": "expected_completion_h", "id": "expected_completion_h"},
+                                                    {"name": "p90_completion_h", "id": "p90_completion_h"},
+                                                    {"name": "expected_lead_h", "id": "expected_lead_h"},
+                                                    {"name": "p90_lead_h", "id": "p90_lead_h"},
+                                                    {"name": "p_late_any_pct", "id": "p_late_any_pct"},
+                                                    {"name": "late_lot_pct", "id": "late_lot_pct"},
+                                                    {"name": "expected_cost", "id": "expected_cost"},
+                                                    {"name": "p90_cost", "id": "p90_cost"},
+                                                    {"name": "expected_cost_per_piece", "id": "expected_cost_per_piece"},
+                                                    {"name": "bottleneck_wait_mode", "id": "bottleneck_wait_mode"},
+                                                    {"name": "bottleneck_util_mode", "id": "bottleneck_util_mode"},
+                                                ],
+                                                data=[],
+                                                page_size=12,
+                                                sort_action="native",
+                                                filter_action="native",
+                                                style_as_list_view=True,
+                                                style_table={"overflowX": "auto"},
+                                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                            ),
                                         ],
                                     ),
-                                ],
+                                ),
                             ),
-                            dmc.Select(
-                                id="sim-toggle-select",
-                                label="Simulation view",
-                                data=[],
-                                value=None,
-                                placeholder="Run simulation to create history",
-                                clearable=True,
-                                searchable=True,
+                            dmc.TabsPanel(
+                                value="quality",
+                                pt="md",
+                                children=dmc.Stack(
+                                    gap="sm",
+                                    children=[
+                                        dmc.Text("Control charts and process capability", fw=800),
+                                        dmc.Text(
+                                            "Uses clean historical process observations in the selected date range. Cp/Cpk use within sigma from moving range; Pp/Ppk use overall process sigma.",
+                                            c="dimmed",
+                                            fz="sm",
+                                        ),
+                                        dmc.Group(
+                                            grow=True,
+                                            children=[
+                                                dmc.Select(
+                                                    id="spc-process",
+                                                    label="Process for control chart",
+                                                    data=option_data(EMPIRICAL_PROCESS_OPTIONS),
+                                                    value="RASPADO" if "RASPADO" in EMPIRICAL_PROCESS_OPTIONS else (EMPIRICAL_PROCESS_OPTIONS[0] if EMPIRICAL_PROCESS_OPTIONS else None),
+                                                    searchable=True,
+                                                    allowDeselect=False,
+                                                ),
+                                                dmc.Select(
+                                                    id="spc-metric",
+                                                    label="Metric",
+                                                    data=[{"label": label, "value": value} for value, label in SPC_METRIC_OPTIONS.items()],
+                                                    value="service_hours",
+                                                    allowDeselect=False,
+                                                ),
+                                                dmc.MultiSelect(
+                                                    id="spc-compare-processes",
+                                                    label="Histogram comparison processes",
+                                                    data=option_data(EMPIRICAL_PROCESS_OPTIONS),
+                                                    value=[p for p in ["RASPADO", "BAUCE"] if p in EMPIRICAL_PROCESS_OPTIONS],
+                                                    searchable=True,
+                                                    clearable=True,
+                                                ),
+                                            ],
+                                        ),
+                                        dmc.Group(
+                                            grow=True,
+                                            children=[
+                                                dmc.NumberInput(id="spc-lsl", label="LSL (hours, optional)", value=None, min=0, step=0.1, decimalScale=4),
+                                                dmc.NumberInput(id="spc-usl", label="USL (hours, optional)", value=None, min=0, step=0.1, decimalScale=4),
+                                                dmc.Switch(id="spc-exclude-iqr", label="Exclude IQR outliers", checked=True),
+                                            ],
+                                        ),
+                                        dmc.Alert(
+                                            color="blue",
+                                            variant="light",
+                                            title="Capability logic for Cp, Cpk, Pp, Ppk",
+                                            children=[
+                                                dmc.Text("LSL/USL are specification limits from engineering, customer requirements, or the SBD when the metric matches. They are not the same as control-chart limits.", fz="sm"),
+                                                dmc.Text("Cp = (USL - LSL) / (6 * within sigma). Cpk = min((USL - mean) / (3 * within sigma), (mean - LSL) / (3 * within sigma)).", fz="sm"),
+                                                dmc.Text("Pp/Ppk use the same formulas, but with overall sigma instead of within sigma. If only USL is known, the app reports one-sided Cpk/Ppk and leaves Cp/Pp blank.", fz="sm"),
+                                            ],
+                                        ),
+                                        dmc.Alert(
+                                            id="spc-notes",
+                                            color="teal",
+                                            variant="light",
+                                            children="Select a process and enter LSL/USL if you want Cp/Cpk/Pp/Ppk.",
+                                        ),
+                                        dcc.Graph(id="spc-control-fig", figure=empty_figure("Select process"), className="plot-card"),
+                                        dcc.Graph(id="spc-hist-fig", figure=empty_figure("Select process"), className="plot-card"),
+                                        dcc.Graph(id="spc-compare-hist-fig", figure=empty_figure("Select processes"), className="plot-card"),
+                                        dash_table.DataTable(
+                                            id="spc-capability-table",
+                                            columns=[
+                                                {"name": "process", "id": "process"},
+                                                {"name": "metric", "id": "metric"},
+                                                {"name": "n", "id": "n"},
+                                                {"name": "mean", "id": "mean"},
+                                                {"name": "median", "id": "median"},
+                                                {"name": "min", "id": "min"},
+                                                {"name": "max", "id": "max"},
+                                                {"name": "std_overall", "id": "std_overall"},
+                                                {"name": "sigma_within_mr", "id": "sigma_within_mr"},
+                                                {"name": "lsl", "id": "lsl"},
+                                                {"name": "usl", "id": "usl"},
+                                                {"name": "cp", "id": "cp"},
+                                                {"name": "cpk", "id": "cpk"},
+                                                {"name": "pp", "id": "pp"},
+                                                {"name": "ppk", "id": "ppk"},
+                                                {"name": "out_of_spec", "id": "out_of_spec"},
+                                                {"name": "out_of_spec_pct", "id": "out_of_spec_pct"},
+                                                {"name": "i_chart_violations", "id": "i_chart_violations"},
+                                                {"name": "mr_chart_violations", "id": "mr_chart_violations"},
+                                                {"name": "raw_rows", "id": "raw_rows"},
+                                                {"name": "strict_removed", "id": "strict_removed"},
+                                                {"name": "iqr_found", "id": "iqr_found"},
+                                                {"name": "iqr_removed", "id": "iqr_removed"},
+                                            ],
+                                            data=[],
+                                            page_size=5,
+                                            sort_action="native",
+                                            filter_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                    ],
+                                ),
                             ),
-                            dash_table.DataTable(
-                                id="lot-table",
-                                columns=[
-                                    {"name": "lot_id", "id": "lot_id"},
-                                    {"name": "lot_name", "id": "lot_name"},
-                                    {"name": "pieces", "id": "pieces"},
-                                    {"name": "steps", "id": "steps"},
-                                    {"name": "route", "id": "route"},
-                                ],
-                                data=[],
-                                page_size=8,
-                                sort_action="native",
-                                filter_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                            dmc.TabsPanel(
+                                value="bayes",
+                                pt="md",
+                                children=dmc.Stack(
+                                    gap="sm",
+                                    children=[
+                                        dmc.Text("Bayesian time classifier", fw=800),
+                                        dmc.Text(
+                                            "Choose two processes and classify a service time using Bayes. This is the same logic as the standalone 8054 app, embedded here for the simulator.",
+                                            c="dimmed",
+                                            fz="sm",
+                                        ),
+                                        dmc.Group(
+                                            grow=True,
+                                            children=[
+                                                dmc.Select(
+                                                    id="sim-bayes-class-a",
+                                                    label="Process A",
+                                                    data=option_data(bayes_core.PROCESS_OPTIONS),
+                                                    value="MEDIDO" if "MEDIDO" in bayes_core.PROCESS_OPTIONS else (bayes_core.PROCESS_OPTIONS[0] if bayes_core.PROCESS_OPTIONS else None),
+                                                    searchable=True,
+                                                    allowDeselect=False,
+                                                ),
+                                                dmc.Select(
+                                                    id="sim-bayes-class-b",
+                                                    label="Process B",
+                                                    data=option_data(bayes_core.PROCESS_OPTIONS),
+                                                    value="TAIC" if "TAIC" in bayes_core.PROCESS_OPTIONS else (bayes_core.PROCESS_OPTIONS[1] if len(bayes_core.PROCESS_OPTIONS) > 1 else None),
+                                                    searchable=True,
+                                                    allowDeselect=False,
+                                                ),
+                                                dmc.DatePickerInput(
+                                                    id="sim-bayes-date-range",
+                                                    label="Arrival date range",
+                                                    type="range",
+                                                    value=[bayes_core.MIN_DATE, bayes_core.MAX_DATE],
+                                                    clearable=False,
+                                                    valueFormat="YYYY-MM-DD",
+                                                ),
+                                            ],
+                                        ),
+                                        dmc.Group(
+                                            grow=True,
+                                            children=[
+                                                dmc.Select(
+                                                    id="sim-bayes-model-kind",
+                                                    label="Likelihood model",
+                                                    data=option_data(["kde", "normal"]),
+                                                    value="kde",
+                                                    allowDeselect=False,
+                                                ),
+                                                dmc.NumberInput(
+                                                    id="sim-bayes-input-time-h",
+                                                    label="Time to classify (hours)",
+                                                    value=3.0,
+                                                    min=0.01,
+                                                    max=72,
+                                                    step=0.1,
+                                                    decimalScale=4,
+                                                ),
+                                                dmc.Select(
+                                                    id="sim-bayes-cap-process",
+                                                    label="Operational cap process",
+                                                    data=option_data(["NONE"] + bayes_core.PROCESS_OPTIONS),
+                                                    value="TAIC" if "TAIC" in bayes_core.PROCESS_OPTIONS else "NONE",
+                                                    searchable=True,
+                                                    allowDeselect=False,
+                                                ),
+                                            ],
+                                        ),
+                                        dmc.Group(
+                                            grow=True,
+                                            children=[
+                                                dmc.Switch(id="sim-bayes-exclude-iqr", label="Exclude IQR outliers", checked=True),
+                                                dmc.Switch(id="sim-bayes-cap-on", label="Apply operational cap", checked=True),
+                                                dmc.NumberInput(
+                                                    id="sim-bayes-cap-h",
+                                                    label="Max hours for capped process",
+                                                    value=4.0,
+                                                    min=0.1,
+                                                    max=72,
+                                                    step=0.25,
+                                                    decimalScale=3,
+                                                ),
+                                            ],
+                                        ),
+                                        dmc.Group(
+                                            grow=True,
+                                            children=[
+                                                dmc.Switch(id="sim-bayes-empirical-prior", label="Use empirical prior", checked=True),
+                                                dmc.NumberInput(
+                                                    id="sim-bayes-manual-prior-a",
+                                                    label="Manual prior P(Process A)",
+                                                    value=0.5,
+                                                    min=0.01,
+                                                    max=0.99,
+                                                    step=0.01,
+                                                    decimalScale=3,
+                                                ),
+                                            ],
+                                        ),
+                                        dmc.Alert(
+                                            id="sim-bayes-output",
+                                            color="indigo",
+                                            variant="light",
+                                            children="Bayesian classifier output will appear here.",
+                                        ),
+                                        dmc.Group(
+                                            grow=True,
+                                            align="stretch",
+                                            children=[
+                                                dcc.Graph(id="sim-bayes-density-fig", figure=empty_figure("Waiting for classifier"), className="plot-card"),
+                                                dcc.Graph(id="sim-bayes-posterior-fig", figure=empty_figure("Waiting for classifier"), className="plot-card"),
+                                            ],
+                                        ),
+                                        dmc.Text("Bayesian classifier summary", fw=700),
+                                        dash_table.DataTable(
+                                            id="sim-bayes-summary-table",
+                                            columns=[{"name": c, "id": c} for c in ["class", "raw_rows", "strict_removed", "iqr_found", "iqr_removed", "cap_removed", "clean_n", "min_h", "max_h", "mean_h", "median_h"]],
+                                            data=[],
+                                            page_size=5,
+                                            sort_action="native",
+                                            filter_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                        dash_table.DataTable(
+                                            id="sim-bayes-validation-table",
+                                            columns=[{"name": c, "id": c} for c in ["metric", "value"]],
+                                            data=[],
+                                            page_size=5,
+                                            sort_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                        dash_table.DataTable(
+                                            id="sim-bayes-confusion-table",
+                                            columns=[{"name": c, "id": c} for c in ["actual", "predicted", "count"]],
+                                            data=[],
+                                            page_size=8,
+                                            sort_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                    ],
+                                ),
                             ),
-                            dmc.Text("Cost by process", fw=700),
-                            dcc.Graph(id="cost-fig", figure=empty_figure("Run simulation"), className="plot-card"),
-                            dmc.Text("Gantt by timeline", fw=700),
-                            dcc.Graph(id="gantt-fig", figure=empty_figure("Run simulation"), className="plot-card"),
-                            dash_table.DataTable(
-                                id="cost-table",
-                                columns=[
-                                    {"name": "process", "id": "process"},
-                                    {"name": "kwh_per_machine_hour", "id": "kwh_per_machine_hour"},
-                                    {"name": "kwh_source", "id": "kwh_source"},
-                                    {"name": "visits", "id": "visits"},
-                                    {"name": "pieces_total", "id": "pieces_total"},
-                                    {"name": "clean_service_min_h", "id": "clean_service_min_h"},
-                                    {"name": "clean_service_max_h", "id": "clean_service_max_h"},
-                                    {"name": "sim_service_min_h", "id": "sim_service_min_h"},
-                                    {"name": "sim_service_max_h", "id": "sim_service_max_h"},
-                                    {"name": "service_total_h", "id": "service_total_h"},
-                                    {"name": "downtime_total_h", "id": "downtime_total_h"},
-                                    {"name": "gas_temp_c", "id": "gas_temp_c"},
-                                    {"name": "gas_cost_per_cuero", "id": "gas_cost_per_cuero"},
-                                    {"name": "energy_cost", "id": "energy_cost"},
-                                    {"name": "labor_cost", "id": "labor_cost"},
-                                    {"name": "gas_cost", "id": "gas_cost"},
-                                    {"name": "total_cost", "id": "total_cost"},
-                                ],
-                                data=[],
-                                page_size=12,
-                                sort_action="native",
-                                filter_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
-                            ),
-                            dmc.Divider(label="SPC + Capability", labelPosition="center"),
-                            dmc.Text("Control charts and process capability", fw=700),
-                            dmc.Text(
-                                "Uses clean historical process observations in the selected date range. Cp/Cpk use within sigma from moving range; Pp/Ppk use overall process sigma.",
-                                c="dimmed",
-                                fz="sm",
-                            ),
-                            dmc.Group(
-                                grow=True,
-                                children=[
-                                    dmc.Select(
-                                        id="spc-process",
-                                        label="Process for control chart",
-                                        data=option_data(EMPIRICAL_PROCESS_OPTIONS),
-                                        value="RASPADO" if "RASPADO" in EMPIRICAL_PROCESS_OPTIONS else (EMPIRICAL_PROCESS_OPTIONS[0] if EMPIRICAL_PROCESS_OPTIONS else None),
-                                        searchable=True,
-                                        allowDeselect=False,
-                                    ),
-                                    dmc.Select(
-                                        id="spc-metric",
-                                        label="Metric",
-                                        data=[{"label": label, "value": value} for value, label in SPC_METRIC_OPTIONS.items()],
-                                        value="service_hours",
-                                        allowDeselect=False,
-                                    ),
-                                    dmc.MultiSelect(
-                                        id="spc-compare-processes",
-                                        label="Histogram comparison processes",
-                                        data=option_data(EMPIRICAL_PROCESS_OPTIONS),
-                                        value=[p for p in ["RASPADO", "BAUCE"] if p in EMPIRICAL_PROCESS_OPTIONS],
-                                        searchable=True,
-                                        clearable=True,
-                                    ),
-                                ],
-                            ),
-                            dmc.Group(
-                                grow=True,
-                                children=[
-                                    dmc.NumberInput(id="spc-lsl", label="LSL (hours, optional)", value=None, min=0, step=0.1, decimalScale=4),
-                                    dmc.NumberInput(id="spc-usl", label="USL (hours, optional)", value=None, min=0, step=0.1, decimalScale=4),
-                                    dmc.Switch(id="spc-exclude-iqr", label="Exclude IQR outliers", checked=True),
-                                ],
-                            ),
-                            dmc.Alert(
-                                color="blue",
-                                variant="light",
-                                title="Capability logic for Cp, Cpk, Pp, Ppk",
-                                children=[
-                                    dmc.Text("LSL/USL are specification limits from engineering, customer requirements, or the SBD when the metric matches. They are not the same as control-chart limits.", fz="sm"),
-                                    dmc.Text("Cp = (USL - LSL) / (6 * within sigma). Cpk = min((USL - mean) / (3 * within sigma), (mean - LSL) / (3 * within sigma)).", fz="sm"),
-                                    dmc.Text("Pp/Ppk use the same formulas, but with overall sigma instead of within sigma. If only USL is known, the app reports one-sided Cpk/Ppk and leaves Cp/Pp blank.", fz="sm"),
-                                ],
-                            ),
-                            dmc.Alert(
-                                id="spc-notes",
-                                color="teal",
-                                variant="light",
-                                children="Select a process and enter LSL/USL if you want Cp/Cpk/Pp/Ppk.",
-                            ),
-                            dcc.Graph(id="spc-control-fig", figure=empty_figure("Select process"), className="plot-card"),
-                            dcc.Graph(id="spc-hist-fig", figure=empty_figure("Select process"), className="plot-card"),
-                            dcc.Graph(id="spc-compare-hist-fig", figure=empty_figure("Select processes"), className="plot-card"),
-                            dash_table.DataTable(
-                                id="spc-capability-table",
-                                columns=[
-                                    {"name": "process", "id": "process"},
-                                    {"name": "metric", "id": "metric"},
-                                    {"name": "n", "id": "n"},
-                                    {"name": "mean", "id": "mean"},
-                                    {"name": "median", "id": "median"},
-                                    {"name": "min", "id": "min"},
-                                    {"name": "max", "id": "max"},
-                                    {"name": "std_overall", "id": "std_overall"},
-                                    {"name": "sigma_within_mr", "id": "sigma_within_mr"},
-                                    {"name": "lsl", "id": "lsl"},
-                                    {"name": "usl", "id": "usl"},
-                                    {"name": "cp", "id": "cp"},
-                                    {"name": "cpk", "id": "cpk"},
-                                    {"name": "pp", "id": "pp"},
-                                    {"name": "ppk", "id": "ppk"},
-                                    {"name": "out_of_spec", "id": "out_of_spec"},
-                                    {"name": "out_of_spec_pct", "id": "out_of_spec_pct"},
-                                    {"name": "i_chart_violations", "id": "i_chart_violations"},
-                                    {"name": "mr_chart_violations", "id": "mr_chart_violations"},
-                                    {"name": "raw_rows", "id": "raw_rows"},
-                                    {"name": "strict_removed", "id": "strict_removed"},
-                                    {"name": "iqr_found", "id": "iqr_found"},
-                                    {"name": "iqr_removed", "id": "iqr_removed"},
-                                ],
-                                data=[],
-                                page_size=5,
-                                sort_action="native",
-                                filter_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
-                            ),
-                            dmc.Divider(label="Bayesian Classifier", labelPosition="center"),
-                            dmc.Text("Bayesian time classifier", fw=700),
-                            dmc.Text(
-                                "Choose two processes and classify a service time using Bayes. This is the same logic as the standalone 8054 app, embedded here for the simulator.",
-                                c="dimmed",
-                                fz="sm",
-                            ),
-                            dmc.Group(
-                                grow=True,
-                                children=[
-                                    dmc.Select(
-                                        id="sim-bayes-class-a",
-                                        label="Process A",
-                                        data=option_data(bayes_core.PROCESS_OPTIONS),
-                                        value="MEDIDO" if "MEDIDO" in bayes_core.PROCESS_OPTIONS else (bayes_core.PROCESS_OPTIONS[0] if bayes_core.PROCESS_OPTIONS else None),
-                                        searchable=True,
-                                        allowDeselect=False,
-                                    ),
-                                    dmc.Select(
-                                        id="sim-bayes-class-b",
-                                        label="Process B",
-                                        data=option_data(bayes_core.PROCESS_OPTIONS),
-                                        value="TAIC" if "TAIC" in bayes_core.PROCESS_OPTIONS else (bayes_core.PROCESS_OPTIONS[1] if len(bayes_core.PROCESS_OPTIONS) > 1 else None),
-                                        searchable=True,
-                                        allowDeselect=False,
-                                    ),
-                                    dmc.DatePickerInput(
-                                        id="sim-bayes-date-range",
-                                        label="Arrival date range",
-                                        type="range",
-                                        value=[bayes_core.MIN_DATE, bayes_core.MAX_DATE],
-                                        clearable=False,
-                                        valueFormat="YYYY-MM-DD",
-                                    ),
-                                ],
-                            ),
-                            dmc.Group(
-                                grow=True,
-                                children=[
-                                    dmc.Select(
-                                        id="sim-bayes-model-kind",
-                                        label="Likelihood model",
-                                        data=option_data(["kde", "normal"]),
-                                        value="kde",
-                                        allowDeselect=False,
-                                    ),
-                                    dmc.NumberInput(
-                                        id="sim-bayes-input-time-h",
-                                        label="Time to classify (hours)",
-                                        value=3.0,
-                                        min=0.01,
-                                        max=72,
-                                        step=0.1,
-                                        decimalScale=4,
-                                    ),
-                                    dmc.Select(
-                                        id="sim-bayes-cap-process",
-                                        label="Operational cap process",
-                                        data=option_data(["NONE"] + bayes_core.PROCESS_OPTIONS),
-                                        value="TAIC" if "TAIC" in bayes_core.PROCESS_OPTIONS else "NONE",
-                                        searchable=True,
-                                        allowDeselect=False,
-                                    ),
-                                ],
-                            ),
-                            dmc.Group(
-                                grow=True,
-                                children=[
-                                    dmc.Switch(id="sim-bayes-exclude-iqr", label="Exclude IQR outliers", checked=True),
-                                    dmc.Switch(id="sim-bayes-cap-on", label="Apply operational cap", checked=True),
-                                    dmc.NumberInput(
-                                        id="sim-bayes-cap-h",
-                                        label="Max hours for capped process",
-                                        value=4.0,
-                                        min=0.1,
-                                        max=72,
-                                        step=0.25,
-                                        decimalScale=3,
-                                    ),
-                                ],
-                            ),
-                            dmc.Group(
-                                grow=True,
-                                children=[
-                                    dmc.Switch(id="sim-bayes-empirical-prior", label="Use empirical prior", checked=True),
-                                    dmc.NumberInput(
-                                        id="sim-bayes-manual-prior-a",
-                                        label="Manual prior P(Process A)",
-                                        value=0.5,
-                                        min=0.01,
-                                        max=0.99,
-                                        step=0.01,
-                                        decimalScale=3,
-                                    ),
-                                ],
-                            ),
-                            dmc.Alert(
-                                id="sim-bayes-output",
-                                color="indigo",
-                                variant="light",
-                                children="Bayesian classifier output will appear here.",
-                            ),
-                            dmc.Group(
-                                grow=True,
-                                align="stretch",
-                                children=[
-                                    dcc.Graph(id="sim-bayes-density-fig", figure=empty_figure("Waiting for classifier"), className="plot-card"),
-                                    dcc.Graph(id="sim-bayes-posterior-fig", figure=empty_figure("Waiting for classifier"), className="plot-card"),
-                                ],
-                            ),
-                            dmc.Text("Bayesian classifier summary", fw=700),
-                            dash_table.DataTable(
-                                id="sim-bayes-summary-table",
-                                columns=[{"name": c, "id": c} for c in ["class", "raw_rows", "strict_removed", "iqr_found", "iqr_removed", "cap_removed", "clean_n", "min_h", "max_h", "mean_h", "median_h"]],
-                                data=[],
-                                page_size=5,
-                                sort_action="native",
-                                filter_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
-                            ),
-                            dash_table.DataTable(
-                                id="sim-bayes-validation-table",
-                                columns=[{"name": c, "id": c} for c in ["metric", "value"]],
-                                data=[],
-                                page_size=5,
-                                sort_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
-                            ),
-                            dash_table.DataTable(
-                                id="sim-bayes-confusion-table",
-                                columns=[{"name": c, "id": c} for c in ["actual", "predicted", "count"]],
-                                data=[],
-                                page_size=8,
-                                sort_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
-                            ),
-                            dmc.Text("Drying gas detail (LTD, TAIC, AEREO only)", fw=700),
-                            dash_table.DataTable(
-                                id="gas-table",
-                                columns=[
-                                    {"name": "process", "id": "process"},
-                                    {"name": "temperature_c", "id": "temperature_c"},
-                                    {"name": "pieces_total", "id": "pieces_total"},
-                                    {"name": "estimated_gas_cost_per_cuero", "id": "gas_cost_per_cuero"},
-                                    {"name": "gas_cost_total", "id": "gas_cost_total"},
-                                ],
-                                data=[],
-                                page_size=8,
-                                sort_action="native",
-                                filter_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
-                            ),
-                            dmc.Text("Fixed drying temperatures", fw=700),
-                            dash_table.DataTable(
-                                id="drying-temp-table",
-                                columns=[
-                                    {"name": "process", "id": "process"},
-                                    {"name": "temperature_c", "id": "temperature_c"},
-                                ],
-                                data=build_drying_temperature_rows(),
-                                page_size=8,
-                                sort_action="native",
-                                filter_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
-                            ),
-                            dmc.Text("Fixed energy reference by process", fw=700),
-                            dash_table.DataTable(
-                                id="energy-ref-table",
-                                columns=[
-                                    {"name": "process", "id": "process"},
-                                    {"name": "kwh_per_machine_hour", "id": "kwh_per_machine_hour"},
-                                    {"name": "source", "id": "source"},
-                                ],
-                                data=build_energy_reference_rows(PROCESS_OPTIONS),
-                                page_size=12,
-                                sort_action="native",
-                                filter_action="native",
-                                style_as_list_view=True,
-                                style_table={"overflowX": "auto"},
-                                style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
-                                style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                            dmc.TabsPanel(
+                                value="references",
+                                pt="md",
+                                children=dmc.Stack(
+                                    gap="sm",
+                                    children=[
+                                        dmc.Text("Reference assumptions", fw=800),
+                                        dmc.Text("Fixed energy and drying-temperature assumptions used by the simulation and cost model.", c="dimmed", fz="sm"),
+                                        dmc.Text("Fixed drying temperatures", fw=700),
+                                        dash_table.DataTable(
+                                            id="drying-temp-table",
+                                            columns=[
+                                                {"name": "process", "id": "process"},
+                                                {"name": "temperature_c", "id": "temperature_c"},
+                                            ],
+                                            data=build_drying_temperature_rows(),
+                                            page_size=8,
+                                            sort_action="native",
+                                            filter_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                        dmc.Text("Fixed energy reference by process", fw=700),
+                                        dash_table.DataTable(
+                                            id="energy-ref-table",
+                                            columns=[
+                                                {"name": "process", "id": "process"},
+                                                {"name": "kwh_per_machine_hour", "id": "kwh_per_machine_hour"},
+                                                {"name": "source", "id": "source"},
+                                            ],
+                                            data=build_energy_reference_rows(PROCESS_OPTIONS),
+                                            page_size=12,
+                                            sort_action="native",
+                                            filter_action="native",
+                                            style_as_list_view=True,
+                                            style_table={"overflowX": "auto"},
+                                            style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+                                            style_cell={"padding": "8px", "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px"},
+                                        ),
+                                    ],
+                                ),
                             ),
                         ],
                     ),
-                ),
+                )
             ],
         ),
     ),
@@ -1734,6 +2357,8 @@ def upload_workbook(contents, filename):
     Input("sim-toggle-select", "value"),
     State("lot-name", "value"),
     State("lot-pieces", "value"),
+    State("lot-due-hours", "value"),
+    State("lot-priority", "value"),
     State("lot-processes", "value"),
     State("lot-repeat", "value"),
     State("lot-store", "data"),
@@ -1747,6 +2372,8 @@ def manage_lots(
     selected_run_id,
     lot_name,
     lot_pieces,
+    lot_due_hours,
+    lot_priority,
     lot_processes,
     lot_repeat,
     lot_store,
@@ -1776,12 +2403,14 @@ def manage_lots(
         pieces = pd.to_numeric(pd.Series([lot_pieces]), errors="coerce").iloc[0]
         repeat_n = pd.to_numeric(pd.Series([lot_repeat]), errors="coerce").iloc[0]
         repeat_n = int(max(1, min(500, int(repeat_n if pd.notna(repeat_n) else 1))))
+        due_h = coerce_numeric(lot_due_hours, 48.0, minimum=0.01, maximum=1000.0)
+        priority = int(round(coerce_numeric(lot_priority, 1.0, minimum=1.0, maximum=99.0)))
 
         if route and pd.notna(pieces) and float(pieces) > 0:
             base_name = str(lot_name).strip() if str(lot_name or "").strip() else f"Lote_{len(store)+1}"
             for i in range(repeat_n):
                 final_name = base_name if repeat_n == 1 else f"{base_name}#{i+1}"
-                store.append({"lot_name": final_name, "pieces": float(pieces), "route": list(route)})
+                store.append({"lot_name": final_name, "pieces": float(pieces), "due_h": due_h, "priority": priority, "route": list(route)})
 
     rows = build_lot_rows(store)
     next_name = f"Lote_{len(store)+1}" if store else "Lote_1"
@@ -1804,6 +2433,7 @@ def manage_lots(
     Input("run-gas", "n_clicks"),
     Input("sim-toggle-select", "value"),
     State("lot-store", "data"),
+    State("scheduling-policy", "value"),
     State("date-range", "value"),
     State("energy-cost", "value"),
     State("labor-cost", "value"),
@@ -1821,6 +2451,7 @@ def run_simulation(
     gas_clicks,
     selected_run_id,
     lot_store,
+    scheduling_policy,
     date_range,
     energy_cost,
     labor_cost,
@@ -1918,22 +2549,12 @@ def run_simulation(
     if not lots_raw:
         return "No lots configured.", "No lots configured.", build_business_summary_children("No lots configured yet."), [], [], empty_figure("No lots configured"), empty_figure("No lots configured"), history
 
-    lots = []
-    for i, lot in enumerate(lots_raw, start=1):
-        route = normalize_sim_route(lot.get("route", []))
-        pieces = pd.to_numeric(pd.Series([lot.get("pieces")]), errors="coerce").iloc[0]
-        if route and pd.notna(pieces) and float(pieces) > 0:
-            lots.append({"lot_name": str(lot.get("lot_name", f"Lote_{i}")), "pieces": float(pieces), "route": list(route)})
+    lots = normalize_lot_store_for_simulation(lots_raw)
 
     if not lots:
         return "Configured lots are invalid.", "Configured lots are invalid.", build_business_summary_children("Configured lots are invalid."), [], [], empty_figure("Invalid lots"), empty_figure("Invalid lots"), history
 
-    base = core.DATAFRAME.copy()
-    if date_range and len(date_range) == 2 and date_range[0] and date_range[1]:
-        start = pd.to_datetime(date_range[0], errors="coerce")
-        end = pd.to_datetime(date_range[1], errors="coerce")
-        if pd.notna(start) and pd.notna(end):
-            base = base[(base["arrival_time"] >= start) & (base["arrival_time"] <= end + pd.Timedelta(days=1))].copy()
+    base = filter_base_for_date_range(date_range)
 
     if base.empty:
         return "No rows in selected date range.", "No rows in selected date range.", build_business_summary_children("No historical rows are available for the selected date range."), [], [], empty_figure("No rows in scope"), empty_figure("No rows in scope"), history
@@ -1941,29 +2562,8 @@ def run_simulation(
     # Fresh RNG each simulation run so between-process gaps are truly random
     # (Uniform 20-30 min), not the same sequence every time.
     rng = np.random.default_rng()
-    ordered_processes = []
-    for lot in lots:
-        for proc in lot["route"]:
-            if proc not in ordered_processes:
-                ordered_processes.append(proc)
-    ordered_empirical_processes = [p for p in ordered_processes if p != RECURTIDO_PROCESS]
-
-    stage_catalog, missing_processes = core.build_stage_catalog_for_processes(
-        base_df=base,
-        process_list=ordered_empirical_processes,
-        strict_cleaning=True,
-        queue_use_downtime=True,
-        rng=rng,
-        rate_iqr_filter=False,
-        rate_iqr_processes=SECADO_RATE_IQR_FILTER_PROCESSES,
-        rate_tail_guardrail=False,
-        rate_tail_guardrail_processes=SECADO_RATE_IQR_FILTER_PROCESSES,
-        no_piece_scaling_processes=SECADO_NO_PIECE_SCALING_PROCESSES,
-        service_hour_caps=SECADO_SERVICE_HOUR_CAPS,
-        service_range_guardrail=True,
-    )
-    if RECURTIDO_PROCESS in ordered_processes:
-        stage_catalog[RECURTIDO_PROCESS] = build_recurtido_stage_spec(recurtido_hours)
+    ordered_processes = ordered_processes_from_lots(lots)
+    stage_catalog, missing_processes = build_fifo_stage_catalog(base, lots, recurtido_hours, rng)
     secado_iqr_notes: list[str] = []
     secado_rate_filter_keys = {core.normalize_process_key(x) for x in SECADO_RATE_IQR_FILTER_PROCESSES}
     secado_cap_notes: list[str] = []
@@ -1987,11 +2587,8 @@ def run_simulation(
             removed_n = max(0, before_n - after_n)
             secado_iqr_notes.append(f"{proc_name}:{before_n}->{after_n} (removed {removed_n})")
 
-    filtered_lots = []
-    for lot in lots:
-        route = [p for p in lot["route"] if p in stage_catalog]
-        if route:
-            filtered_lots.append({"lot_name": lot["lot_name"], "pieces": lot["pieces"], "route": route})
+    filtered_lots = filter_lots_to_stage_catalog(lots, stage_catalog)
+    filtered_lots = order_lots_by_scheduling_policy(filtered_lots, stage_catalog, scheduling_policy)
 
     if not filtered_lots:
         return "No usable stages for selected lots.", "No usable stages for selected lots.", build_business_summary_children("No usable process stages were found for the selected lots."), [], [], empty_figure("No usable stage data"), empty_figure("No usable stage data"), history
@@ -2163,6 +2760,8 @@ def run_simulation(
         f"{proc}={int(spec.get('servers', 1))}"
         for proc, spec in stage_catalog.items()
     )
+    policy_key = str(scheduling_policy or "FIFO").strip().upper()
+    policy_txt = SCHEDULING_POLICY_LABELS.get(policy_key, "FIFO")
 
     missing_txt = f" Missing stage data: {', '.join(sorted(set(missing_processes)))}." if missing_processes else ""
     fallback_txt = (
@@ -2187,7 +2786,7 @@ def run_simulation(
         f"cost_per_piece=${core.safe_number(cost_per_piece, 4)}. "
         f"service_times_bounded_by_clean_observed_min_max."
         f" secado_mode=empirical_direct_service_with_operational_caps(no_piece_scaling)."
-        f" flow_timeline=parallel_machine_flow_simpy; lot_release=parallel_at_t0; machines={capacity_txt}."
+        f" flow_timeline=parallel_machine_flow_simpy; scheduling_policy={policy_txt}; lot_release=parallel_at_t0; machines={capacity_txt}."
         + compare_txt
         + missing_txt
         + fallback_txt
@@ -2274,6 +2873,138 @@ def run_simulation(
     history.insert(0, current_payload)
     history = history[:50]
     return summary, gas_summary, business_children, rows_with_total, gas_rows, fig, gantt_fig, history
+
+
+@mini_app.callback(
+    Output("fifo-scenario-summary", "children"),
+    Output("fifo-scenario-table", "data"),
+    Output("fifo-risk-fig", "figure"),
+    Output("fifo-cost-risk-fig", "figure"),
+    Input("run-fifo-scenarios", "n_clicks"),
+    State("lot-store", "data"),
+    State("fifo-policy-select", "value"),
+    State("fifo-release-policy", "value"),
+    State("fifo-reps", "value"),
+    State("fifo-release-spacing-hours", "value"),
+    State("fifo-capacity-delta", "value"),
+    State("fifo-split-threshold-pieces", "value"),
+    State("date-range", "value"),
+    State("energy-cost", "value"),
+    State("labor-cost", "value"),
+    State("gas-cost-per-cuero-50c", "value"),
+    State("recurtido-hours", "value"),
+)
+def run_fifo_policy_comparison(
+    n_clicks,
+    lot_store,
+    selected_policies,
+    release_policy,
+    reps_value,
+    release_spacing_h,
+    capacity_delta,
+    split_threshold,
+    date_range,
+    energy_cost,
+    labor_cost,
+    gas_cost_per_cuero_50c,
+    recurtido_hours,
+):
+    if not n_clicks:
+        msg = "Pick policies and run scenario comparison to estimate completion risk, lateness, bottlenecks, and cost."
+        return msg, [], empty_figure("Run FIFO policy comparison"), empty_figure("Run FIFO policy comparison")
+
+    if core.DATAFRAME.empty:
+        msg = "No data loaded. Upload a production workbook before comparing policies."
+        return msg, [], empty_figure("No data loaded"), empty_figure("No data loaded")
+
+    lots = normalize_lot_store_for_simulation(lot_store)
+    if not lots:
+        msg = "No configured lots. Add lots before comparing scheduling policies."
+        return msg, [], empty_figure("No lots configured"), empty_figure("No lots configured")
+
+    base = filter_base_for_date_range(date_range)
+    if base.empty:
+        msg = "No historical rows in the selected date range."
+        return msg, [], empty_figure("No rows in scope"), empty_figure("No rows in scope")
+
+    policies = [str(p).strip().upper() for p in (selected_policies or []) if str(p).strip()]
+    valid_policy_keys = {item["value"] for item in SCHEDULING_POLICY_OPTIONS}
+    policies = [p for p in policies if p in valid_policy_keys]
+    if not policies:
+        policies = ["FIFO"]
+    policies = policies[: len(SCHEDULING_POLICY_OPTIONS)]
+
+    rng = np.random.default_rng()
+    stage_catalog, missing_processes = build_fifo_stage_catalog(base, lots, recurtido_hours, rng)
+    filtered_lots = filter_lots_to_stage_catalog(lots, stage_catalog)
+    if not filtered_lots:
+        msg = "No usable process stages were found for the selected lots."
+        return msg, [], empty_figure("No usable stage data"), empty_figure("No usable stage data")
+
+    reps = int(round(coerce_numeric(reps_value, 50.0, minimum=5.0, maximum=300.0)))
+    release_policy_key = str(release_policy or "parallel").strip().lower()
+    release_policy_key = release_policy_key if release_policy_key in {"parallel", "staggered"} else "parallel"
+    spacing_h = coerce_numeric(release_spacing_h, 0.5, minimum=0.01, maximum=48.0)
+    cap_delta = int(round(coerce_numeric(capacity_delta, 0.0, minimum=0.0, maximum=5.0)))
+    split_threshold_value = coerce_numeric(split_threshold, 0.0, minimum=0.0, maximum=100000.0)
+    energy_cost_value = coerce_numeric(energy_cost, 0.12, minimum=0.0)
+    labor_cost_value = coerce_numeric(labor_cost, 60.0, minimum=0.0)
+    gas_cost_value = coerce_numeric(gas_cost_per_cuero_50c, 0.12, minimum=0.0)
+    due_values = [coerce_numeric(lot.get("due_h"), 48.0, minimum=0.01) for lot in filtered_lots]
+    due_default = float(np.nanmax(due_values)) if due_values else 48.0
+
+    rows: list[dict] = []
+    for policy in policies:
+        policy_label = SCHEDULING_POLICY_LABELS.get(policy, policy)
+        scenario_name = policy_label
+        if release_policy_key == "staggered":
+            scenario_name += f" | stagger {core.safe_number(spacing_h, 2)}h"
+        if cap_delta > 0:
+            scenario_name += f" | +{cap_delta} cap"
+        if split_threshold_value > 0:
+            scenario_name += f" | split>{core.safe_number(split_threshold_value, 0)}"
+
+        row = run_fifo_scenario_batch(
+            stage_catalog=stage_catalog,
+            base_lots=filtered_lots,
+            scenario={
+                "name": scenario_name,
+                "scheduling_policy": policy,
+                "release_policy": release_policy_key,
+                "release_spacing_h": spacing_h,
+                "capacity_delta": cap_delta,
+                "split": split_threshold_value > 0,
+                "split_threshold": split_threshold_value,
+            },
+            reps=reps,
+            due_h=due_default,
+            energy_cost=energy_cost_value,
+            labor_cost=labor_cost_value,
+            gas_cost_per_cuero_50c=gas_cost_value,
+            rng=rng,
+        )
+        if row:
+            rows.append(row)
+
+    if not rows:
+        msg = "Policy comparison produced no valid simulation events."
+        return msg, [], empty_figure("No scenario events"), empty_figure("No scenario events")
+
+    table_rows = sorted(rows, key=lambda r: (float(r.get("expected_completion_h", np.inf)), float(r.get("p_late_any_pct", np.inf))))
+    best_completion = min(table_rows, key=lambda r: float(r.get("expected_completion_h", np.inf)))
+    best_late = min(table_rows, key=lambda r: float(r.get("p_late_any_pct", np.inf)))
+    best_cost = min(table_rows, key=lambda r: float(r.get("expected_cost", np.inf)))
+    missing_txt = f" Missing stage data: {', '.join(sorted(set(missing_processes)))}." if missing_processes else ""
+    summary = (
+        f"Scheduling comparison complete | policies={len(policies)}, reps={reps} each, "
+        f"release={release_policy_key}, capacity_delta={cap_delta}, "
+        f"split_threshold={'off' if split_threshold_value <= 0 else core.safe_number(split_threshold_value, 0)} pieces. "
+        f"Best expected completion={best_completion['scenario']} ({core.safe_number(best_completion.get('expected_completion_h'), 2)} h). "
+        f"Lowest lateness risk={best_late['scenario']} ({core.safe_number(best_late.get('p_late_any_pct'), 2)}% any late). "
+        f"Lowest expected cost={best_cost['scenario']} (${core.safe_number(best_cost.get('expected_cost'), 2)})."
+        f"{missing_txt}"
+    )
+    return summary, table_rows, build_fifo_risk_figure(table_rows), build_fifo_cost_figure(table_rows)
 
 
 @mini_app.callback(
