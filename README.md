@@ -6,12 +6,13 @@ This project reflects work from my data science role in a production plant. The 
 
 No production workbooks or proprietary plant data are included in this repository.
 
-The repository now contains two related Dash apps:
+The repository now contains three related Dash apps:
 
 | App | File | Default Port | Purpose |
 | --- | --- | --- | --- |
 | Production Flow Decision Studio | `new_sim_app.py` | `8050` | Simulates lot flow, scheduling policies, cost, SPC, capability, and Bayesian process classification. |
 | Bottleneck Early-Warning System | `bottleneck_warning_app.py` | `8055` | Uses current WIP plus cleaned historical process times to predict process overload risk before the shift unfolds. |
+| Lot-Splitting Optimization Studio | `lot_splitting_optimizer_app.py` | `8057` | Compares one large lot against smaller sublots using SimPy, stochastic service times, and cost tradeoff analysis. |
 
 ## Quick Look
 
@@ -32,7 +33,8 @@ The app turns raw production logbook data into an interactive planning workflow:
 3. Enter lots, piece counts, repeats, and process routes.
 4. Simulate lot movement through plant processes using SimPy.
 5. Compare scheduling policies under stochastic process times.
-6. Review simulation results through separate tabs for scheduling, cost, timeline, SPC, capability, and Bayesian process classification.
+6. Compare lot-splitting strategies such as `1 x 600`, `2 x 300`, and `3 x 200`.
+7. Review simulation results through separate tabs for scheduling, cost, timeline, SPC, capability, and Bayesian process classification.
 
 The main goal was to connect data cleaning, EDA, queueing simulation, statistical process control, and business reporting in one tool that a non-technical plant user could operate.
 
@@ -71,6 +73,8 @@ The input area stays at the top of the app so the user can add lots, choose a ro
 - How do release timing, capacity, and lot splitting assumptions affect lead-time risk?
 - Which process should managers watch today before the queue becomes expensive?
 - What is the probability that a process exceeds a utilization warning threshold?
+- Should production run one large lot or split it into smaller sublots?
+- What split count reduces P90 lead time without increasing cost too much?
 - How do labor, energy, and gas costs change by lot mix?
 - Which processes show unstable, unusual, or out-of-spec timing behavior?
 - Are process times within user-defined lower and upper specification limits?
@@ -192,6 +196,58 @@ Outputs include:
 
 This module is intentionally separate from the full simulator. The simulator answers “what happens to this lot plan?” The early-warning app answers “what should we watch today?”
 
+## Lot-Splitting Optimization Studio
+
+The third app focuses on a practical operations-research question:
+
+```text
+Should we process one lot of 600 pieces, or split it into smaller sublots?
+```
+
+Splitting a large lot can reduce blocking and improve flow because downstream processes can begin working on the first sublot before the entire original lot is complete. The tradeoff is that smaller sublots may increase handling, setup, or administrative cost.
+
+The app lets the user enter:
+
+- Total pieces in the original lot
+- Candidate split counts such as `1,2,3,4,6`
+- Process route
+- Labor cost per hour
+- Energy cost per kWh
+- Extra setup/handling cost per sublot
+- Maximum acceptable cost increase compared with the no-split baseline
+- Number of Monte Carlo simulation runs
+- Parallel or staggered sublot release mode
+
+The optimizer then creates competing strategies such as:
+
+- `1 lot x 600`
+- `2 lots x 300`
+- `3 lots x 200`
+- `4 lots x 150`
+- `6 lots x 100`
+
+Each strategy is simulated repeatedly with SimPy using:
+
+- Cleaned empirical service-time samples
+- Process/server capacity from the machine catalog
+- FIFO resource queues inside each process
+- Random `20-30` minute transfer gaps between process steps
+- Energy, labor, and handling/setup cost assumptions
+
+Outputs include:
+
+- Mean completion time
+- P90 completion time
+- Mean and P90 sublot lead time
+- Expected cost
+- P90 cost
+- Cost per piece
+- Throughput in pieces per hour
+- Most common waiting bottleneck
+- Recommended strategy
+
+The recommendation rule is intentionally transparent: choose the lowest P90 completion time among strategies that stay within the user-selected cost increase limit compared with the no-split baseline. This keeps the tool useful for production planning because it does not simply choose the fastest option if that option creates too much extra cost.
+
 ## Cost Model
 
 The simulator estimates cost by process and by total run.
@@ -242,12 +298,14 @@ This was added as a decision-support tool, not as a final production labeler.
 ```text
 new_sim_app.py          Main simulator app
 bottleneck_warning_app.py Daily WIP bottleneck early-warning app
+lot_splitting_optimizer_app.py Lot-splitting and sublot optimization app
 app.py                  Core data cleaning, EDA, queueing, and helper logic
 bayes_classifier_app.py Bayesian classifier module
 process_eda.py          Standalone per-process EDA utility
 assets/studio.css       App styling
 Dockerfile              Docker image definition
 Dockerfile.bottleneck   Docker image definition for the bottleneck warning app
+Dockerfile.lot_split    Docker image definition for the lot-splitting optimizer
 docker-compose.yml      Docker Compose configuration
 requirements.txt        Python dependencies
 ```
@@ -284,11 +342,23 @@ Open:
 http://127.0.0.1:8055
 ```
 
+Run the lot-splitting optimizer:
+
+```bash
+LOT_SPLIT_APP_PORT=8057 python3 -u lot_splitting_optimizer_app.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:8057
+```
+
 ## Run with Docker
 
-The current Docker setup still works for the latest app changes. The scheduling and tabbed-layout updates are code-level changes inside `new_sim_app.py`; no new Python packages, startup command, or Dockerfile changes are required. Rebuild the image when you want the container to include the newest code.
+Each app has its own Docker entrypoint. Rebuild the relevant image when you want the container to include the newest code.
 
-Build the image:
+Build the main simulator image:
 
 ```bash
 docker build -t empirical-lot-cost-simulator .
@@ -324,6 +394,12 @@ Run only the bottleneck warning app:
 docker compose up --build bottleneck-warning
 ```
 
+Run only the lot-splitting optimizer:
+
+```bash
+docker compose up --build lot-splitting-optimizer
+```
+
 Optional local data mount:
 
 ```text
@@ -338,6 +414,8 @@ SIM_APP_HOST=127.0.0.1        # Use 0.0.0.0 in Docker
 SIM_APP_PORT=8050
 BOTTLENECK_APP_HOST=127.0.0.1 # Use 0.0.0.0 in Docker
 BOTTLENECK_APP_PORT=8055
+LOT_SPLIT_APP_HOST=127.0.0.1 # Use 0.0.0.0 in Docker
+LOT_SPLIT_APP_PORT=8057
 RASPADO_XLSX_PATH=/path/to/default_workbook.xlsx
 RASPADO_SHEET=TIEMPOS
 ENERGY_REF_XLSX_PATH=/path/to/energy_reference.xlsx
@@ -349,6 +427,7 @@ ENERGY_REF_SHEET=Hoja1
 - Operations research simulation
 - Production process EDA
 - Queueing analysis and capacity modeling
+- Simulation-based lot sizing and sublot optimization
 - Data cleaning from Excel-based operational records
 - Cost modeling for plant processes
 - Statistical process control, Cp/Cpk, and Pp/Ppk capability analysis
