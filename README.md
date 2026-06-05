@@ -6,6 +6,13 @@ This project reflects work from my data science role in a production plant. The 
 
 No production workbooks or proprietary plant data are included in this repository.
 
+The repository now contains two related Dash apps:
+
+| App | File | Default Port | Purpose |
+| --- | --- | --- | --- |
+| Production Flow Decision Studio | `new_sim_app.py` | `8050` | Simulates lot flow, scheduling policies, cost, SPC, capability, and Bayesian process classification. |
+| Bottleneck Early-Warning System | `bottleneck_warning_app.py` | `8055` | Uses current WIP plus cleaned historical process times to predict process overload risk before the shift unfolds. |
+
 ## Quick Look
 
 Screenshots below use a synthetic demo workbook. No production workbooks or proprietary plant data are included.
@@ -62,6 +69,8 @@ The input area stays at the top of the app so the user can add lots, choose a ro
 - Which route creates the longest lead time or bottleneck?
 - Which scheduling policy gives the best expected completion time or lowest lateness risk?
 - How do release timing, capacity, and lot splitting assumptions affect lead-time risk?
+- Which process should managers watch today before the queue becomes expensive?
+- What is the probability that a process exceeds a utilization warning threshold?
 - How do labor, energy, and gas costs change by lot mix?
 - Which processes show unstable, unusual, or out-of-spec timing behavior?
 - Are process times within user-defined lower and upper specification limits?
@@ -147,6 +156,42 @@ Each policy is simulated repeatedly using stochastic process times from the clea
 
 This keeps the app useful for operations research planning: instead of only simulating one schedule, the user can compare policies under uncertainty before choosing a release plan.
 
+## Bottleneck Early-Warning System
+
+The second app is a focused decision-support tool for daily capacity risk.
+
+Business question:
+
+```text
+Which process should managers watch today?
+```
+
+A manager enters current WIP by process, such as:
+
+- `RASPADO`: 18 lots
+- `BAUCE`: 9 lots
+- `VACIO`: 4 lots
+
+The app then combines:
+
+- Current WIP entered by the user
+- Historical arrival rates from the production logbook
+- Cleaned empirical service-time samples after strict validation and IQR screening
+- Process capacity from the machine/server catalog
+- Monte Carlo simulation over the selected forecast horizon
+
+Outputs include:
+
+- Expected utilization by process
+- P90 utilization by process
+- Overload probability
+- Expected and P90 delay
+- Projected queue path over the shift
+- Risk label: `High`, `Medium`, `Low`, or `Review data`
+- Plain-language alert messages for managers
+
+This module is intentionally separate from the full simulator. The simulator answers “what happens to this lot plan?” The early-warning app answers “what should we watch today?”
+
 ## Cost Model
 
 The simulator estimates cost by process and by total run.
@@ -196,11 +241,13 @@ This was added as a decision-support tool, not as a final production labeler.
 
 ```text
 new_sim_app.py          Main simulator app
+bottleneck_warning_app.py Daily WIP bottleneck early-warning app
 app.py                  Core data cleaning, EDA, queueing, and helper logic
 bayes_classifier_app.py Bayesian classifier module
 process_eda.py          Standalone per-process EDA utility
 assets/studio.css       App styling
 Dockerfile              Docker image definition
+Dockerfile.bottleneck   Docker image definition for the bottleneck warning app
 docker-compose.yml      Docker Compose configuration
 requirements.txt        Python dependencies
 ```
@@ -223,6 +270,18 @@ Open:
 
 ```text
 http://127.0.0.1:8050
+```
+
+Run the bottleneck warning app:
+
+```bash
+BOTTLENECK_APP_PORT=8055 python3 -u bottleneck_warning_app.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:8055
 ```
 
 ## Run with Docker
@@ -253,6 +312,18 @@ Docker Compose:
 docker compose up --build
 ```
 
+Run only the main simulator:
+
+```bash
+docker compose up --build production-flow-studio
+```
+
+Run only the bottleneck warning app:
+
+```bash
+docker compose up --build bottleneck-warning
+```
+
 Optional local data mount:
 
 ```text
@@ -265,6 +336,8 @@ Optional local data mount:
 ```bash
 SIM_APP_HOST=127.0.0.1        # Use 0.0.0.0 in Docker
 SIM_APP_PORT=8050
+BOTTLENECK_APP_HOST=127.0.0.1 # Use 0.0.0.0 in Docker
+BOTTLENECK_APP_PORT=8055
 RASPADO_XLSX_PATH=/path/to/default_workbook.xlsx
 RASPADO_SHEET=TIEMPOS
 ENERGY_REF_XLSX_PATH=/path/to/energy_reference.xlsx

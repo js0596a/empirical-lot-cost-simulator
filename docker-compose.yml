@@ -13,3 +13,20 @@ services:
     volumes:
       - ./outputs/uploads:/app/outputs/uploads
       - ./data:/app/data:ro
+
+  bottleneck-warning:
+    build:
+      context: .
+      dockerfile: Dockerfile.bottleneck
+    image: bottleneck-warning-system:latest
+    ports:
+      - "8055:8055"
+    environment:
+      BOTTLENECK_APP_HOST: 0.0.0.0
+      BOTTLENECK_APP_PORT: 8055
+      # Optional: mount a default workbook at ./data/production.xlsx.
+      RASPADO_XLSX_PATH: /app/data/production.xlsx
+      ENERGY_REF_XLSX_PATH: /app/data/energy.xlsx
+    volumes:
+      - ./outputs/bottleneck_uploads:/app/outputs/bottleneck_uploads
+      - ./data:/app/data:ro
